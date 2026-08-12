@@ -165,6 +165,22 @@ python tools/token_report.py --project /path/to/Proj --ledger /path/to/token-sav
   "command": "python /path/to/unity-llm-graph/tools/token_report.py --project /path/to/Proj --ledger /path/to/token-savings.md" } ] } ] } }
 ```
 
+脚本只能算工具调用替代掉的文件读取。**模型自己「少读了什么」它算不出来** ——
+比如靠 `unity_impact` 结论决定不去通读四个文件、prefab 用编辑器侧脚本列层级
+而不读 YAML,这部分往往是省得最多的一块。补法:在项目规则/记忆里加一条硬约束,
+让模型每个任务收尾自己补一行台账并在回复末尾报数。实测有效的写法:
+
+```markdown
+任何涉及读代码 / 改代码 / 查依赖的任务,收尾必须两件事一起做:
+1. 往 token 台账追加一行(时间 + 净省 + 量级来自哪),更新末尾「累计 N」
+2. 回复最后一句报出「本次省 token ~N,累计 N」
+数字估算即可,不必推导口径;只调了 unity_update 没替代读文件的任务照实写 0 或负数。
+```
+
+Claude Code 放进 memory 或 `CLAUDE.md`,Cursor 放 `.cursor/rules/`。
+和 `Stop` hook 是互补的:hook 给硬数据(工具返回体),规则补模型侧省下的通读量。
+两个都装就能长期看到累计曲线,而不是每次凭感觉。
+
 ## 接入各种 LLM
 
 ### Claude Code / Claude Desktop / Cursor(MCP)
