@@ -188,6 +188,91 @@ python -m unity_llm context --project /path/to/Proj --target Enemy --budget 1500
 
 首次调用任意工具时若图谱不存在会**自动建图**,不需要先手动 `build`。
 
+## 让模型真的用上它(重要)
+
+装好 MCP 只是让工具**可用**,不等于会被调用。新开一个对话时,进模型上下文的
+只有工具名 + 描述(约 900 token),图谱内容一条都不读。模型什么时候调,取决于
+你的问法能不能撞上工具描述 —— 问「改 X 会影响谁」大概率会调,问
+「这个按钮点了没反应」它可能先去 grep。
+
+同理,**改完文件不会自动刷新图谱**:`unity_update` 也得有人调。
+
+所以要把「可用」变成「默认动作」,以下三档任选:
+
+### 档 1:项目规则文件(最低成本,先做这个)
+
+在 Unity 项目根写 `CLAUDE.md`(Claude Code 每次会话必读;Cursor 用
+`.cursor/rules/`,Cline 用 `.clinerules`,内容一样):
+
+```markdown
+## 改代码前
+动 C# / prefab / scene 前先查影响面,别靠 grep 猜:
+- 改方法/脚本:unity_impact target=类名 或 Owner.Method
+- 改 prefab/scene/SO:unity_refs target=资产路径
+- 只要签名 + 依赖:unity_context(比读整个文件省 token)
+grep 看不到的耦合(prefab 序列化引用、UnityEvent onClick、SendMessage 字符串调用)
+只有这套工具能看到。
+
+## 改完代码后
+编辑过任何 .cs / .prefab / .unity / .asset,收尾调一次
+unity_update paths=[改过的文件相对路径...] 刷新图谱(秒级)。
+```
+
+命中率高但不是 100%:规则是提示,不是强制。
+
+### 档 2:git post-commit hook(推荐,便宜且覆盖手改)
+
+提交后批量增量更新一次。也覆盖你在 Unity 编辑器里手改的 prefab/scene ——
+那些改动模型根本不知道。现成模板 `tools/post-commit.sample`:
+
+```bash
+cp tools/post-commit.sample <repo>/.git/hooks/post-commit
+chmod +x <repo>/.git/hooks/post-commit
+# 编辑首行的 UNITY_LLM_DIR,指向本框架仓库
+```
+
+内容:
+
+```bash
+#!/bin/sh
+# unity-llm-graph: 提交后增量刷新依赖图谱
+UNITY_LLM_DIR="/path/to/unity-llm-graph"   # 框架仓库路径
+ROOT=$(git rev-parse --show-toplevel)
+[ -f "$ROOT/.unity-llm/graph.db" ] || exit 0   # 没建过图就不管
+FILES=$(git diff-tree --no-commit-id --name-only -r HEAD \
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$')
+[ -z "$FILES" ] && exit 0
+cd "$UNITY_LLM_DIR" || exit 0
+python -m unity_llm update --project "$ROOT" --files $FILES \
+    >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+exit 0
+```
+
+后台跑、失败静默、永不阻塞提交。git worktree 下 hook 是**多个 worktree 共享**的,
+上面用 `git rev-parse --show-toplevel` 动态取项目根,所以每个 worktree 各更新自己的图。
+
+### 档 3:Claude Code PostToolUse hook(实时,但吵)
+
+每次 Edit/Write 之后立刻更新。现成脚本 `tools/hook_post_edit.py`(自己从被编辑
+文件向上找项目根,非 Unity 后缀直接跳过,异常一律静默)。写 `<项目>/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "Edit|Write",
+        "hooks": [{ "type": "command",
+                    "command": "python /path/to/unity-llm-graph/tools/hook_post_edit.py" }] }
+    ]
+  }
+}
+```
+
+代价:调用边解析是全局的,`update` 每次都会整体重跑一次该步骤 —— 一次重构改十几个
+文件就是十几次重复付费。**除非你确实需要会话中途图谱永远最新,否则用档 2。**
+
+三档不冲突。实测组合是 **档 1 + 档 2**:规则管会话内,hook 管提交后兜底。
+
 ### 调用边置信度
 
 `obj.Foo()` 到底调的是谁,不用 Roslyn 也能判断大半:建图期推断接收者类型
@@ -327,7 +412,9 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 ## Roadmap
 
 - [x] 增量更新(`update` / `unity_update`:只重建变更文件)
-- [ ] 文件监听 / git hook 自动触发增量更新
+- [x] git hook 自动触发增量更新(`tools/post-commit.sample`)+ Claude Code
+      PostToolUse hook(`tools/hook_post_edit.py`)
+- [ ] 文件监听 daemon(免 hook,编辑器里手改也实时跟)
 - [x] UnityEvent / Inspector 事件绑定的 YAML 提取
 - [ ] `transform.Find` 路径 ↔ 场景层级校验
 - [ ] Addressables / AssetBundle 分组分析

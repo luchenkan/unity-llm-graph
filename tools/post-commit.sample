@@ -1,0 +1,26 @@
+#!/bin/sh
+# unity-llm-graph: git post-commit hook —— 提交后增量刷新依赖图谱。
+#
+# 装法:
+#   cp tools/post-commit.sample <repo>/.git/hooks/post-commit
+#   chmod +x <repo>/.git/hooks/post-commit
+#   然后把下面 UNITY_LLM_DIR 改成本框架仓库路径
+#
+# git worktree:hook 目录是多个 worktree 共享的,这里用 --show-toplevel
+# 动态取当前项目根,所以每个 worktree 各自更新自己的图谱。
+# 后台执行 + 静默失败,永不阻塞提交。
+
+UNITY_LLM_DIR="/c/Users/you/unity-llm-graph"
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$ROOT/.unity-llm/graph.db" ] || exit 0   # 没建过图就不管
+
+FILES=$(git diff-tree --no-commit-id --name-only -r HEAD \
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$')
+[ -z "$FILES" ] && exit 0
+
+cd "$UNITY_LLM_DIR" 2>/dev/null || exit 0
+python -m unity_llm update --project "$ROOT" --files $FILES \
+    >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+
+exit 0
