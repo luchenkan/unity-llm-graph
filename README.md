@@ -142,6 +142,29 @@ MCP server 会把每次工具调用记一行 JSON:工具名、参数、返回体
 python -c "import json,sys;print(sum(json.loads(l)['approx_tokens'] for l in open(sys.argv[1],encoding='utf-8') if l.strip()))" /path/to/Proj/.unity-llm/calls.log
 ```
 
+### 省了多少:`tools/token_report.py`
+
+结算「净节省」并追加进一个 Markdown 台账,顺便打印一行
+`Unity-LLM已经帮你节省了Token：N`:
+
+```bash
+python tools/token_report.py --project /path/to/Proj --ledger /path/to/token-savings.md
+```
+
+口径刻意保守:`baseline` 是这些调用涉及的源文件**全文** token(不用图谱时模型得整篇
+读进上下文,按 graph.db 里的类名/方法名/资产路径解析,同一文件只算一次),
+`spent` 是实际返回体的 `approx_tokens`,`net = baseline - spent`。
+`unity_update` / `stats` 这类不替代读文件的调用只计 spent,所以净收益可能为负 —— 不虚增。
+
+游标存 `.unity-llm/token_report.state`,每次只结算新增的调用;台账里放一行
+`<!-- token-ledger -->`,新记录插在它下面(文件不存在就不写,不乱建文件)。
+配成 Claude Code 的 `Stop` hook 就是每个任务结束自动报一次:
+
+```json
+{ "hooks": { "Stop": [ { "hooks": [ { "type": "command",
+  "command": "python /path/to/unity-llm-graph/tools/token_report.py --project /path/to/Proj --ledger /path/to/token-savings.md" } ] } ] } }
+```
+
 ## 接入各种 LLM
 
 ### Claude Code / Claude Desktop / Cursor(MCP)
