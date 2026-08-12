@@ -65,7 +65,7 @@ Unity 恰恰是个反例——最要命的耦合写在 **prefab / scene 的 YAML
 
 ```bash
 # 克隆后直接使用;或 pip install -e . 获得 unity-llm 命令
-git clone https://github.com/<you>/unity-llm-graph.git
+git clone https://github.com/luchenkan/unity-llm-graph.git
 cd unity-llm-graph
 
 # 1. 对你的 Unity 项目建图(几秒到几十秒,取决于项目规模)
@@ -91,7 +91,7 @@ python -m unity_llm validate --project /path/to/YourUnityProject
 Zero third-party deps, Python ≥ 3.9 (standard library only).
 
 ```bash
-git clone https://github.com/<you>/unity-llm-graph.git
+git clone https://github.com/luchenkan/unity-llm-graph.git
 cd unity-llm-graph
 
 # 1. Build the graph for your Unity project (seconds to ~1 min)
