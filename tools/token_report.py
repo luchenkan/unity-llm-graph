@@ -157,13 +157,17 @@ def main() -> int:
 
 def _append_ledger(path: str, recs: list, files: list, baseline: int,
                    spent: int, net: int, total: int) -> None:
-    tools = {}
-    for r in recs:
-        tools[r.get("tool", "?")] = tools.get(r.get("tool", "?"), 0) + 1
-    row = "| %s | %s | %d | %d | **%d** | %d |\n" % (
-        time.strftime("%Y-%m-%d %H:%M"),
-        " ".join("%s×%d" % (k, v) for k, v in sorted(tools.items())),
-        baseline, spent, net, total)
+    """台账只写「省了多少 + 量级来自哪」,不写口径推导。"""
+    if files:
+        why = "少读 %s" % os.path.basename(files[0])
+        if len(files) > 1:
+            why += " 等 %d 个文件全文" % len(files)
+        else:
+            why += " 全文"
+    else:
+        why = "%d 次图谱查询替代通读" % len(recs)
+    row = "| %s | %s | %s |\n" % (
+        time.strftime("%Y-%m-%d %H:%M"), format(net, ","), why)
     try:
         if not os.path.exists(path):
             return  # 台账文件由人维护,不自动创建,避免写到奇怪地方
@@ -175,13 +179,8 @@ def _append_ledger(path: str, recs: list, files: list, baseline: int,
             text = head + marker + "\n" + row + tail.lstrip("\n")
         else:
             text = text.rstrip("\n") + "\n" + row
-        if files:
-            note = "<!-- last-files: %s -->" % ", ".join(files[:6])
-            if "<!-- last-files:" in text:
-                import re
-                text = re.sub(r"<!-- last-files:.*?-->", note, text, count=1)
-            else:
-                text = text.rstrip("\n") + "\n\n" + note + "\n"
+        import re
+        text = re.sub(r"累计 [\d,]+。", "累计 %s。" % format(total, ","), text, count=1)
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
     except Exception:
