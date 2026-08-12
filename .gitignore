@@ -1,0 +1,15 @@
+# 构建产物
+.unity-llm/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# 测试 fixture 里生成的占位二进制
+tests/fixtures/SampleProject/Assets/UI/HealthBar.png
+
+# IDE
+.idea/
+.vs/
+.vscode/
