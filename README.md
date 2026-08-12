@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-104%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-106%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / methods / calls / inheritance / engine lifecycle callbacks)
@@ -130,6 +130,17 @@ If your `.meta` GUIDs were rewritten by an asset-protection tool, see
 
 命令行也能临时排除:`python -m unity_llm deadcode --project P --exclude ART_TEST Sandbox`。
 `init-config` 会顺手打印一份可用的 `.unity-llm.json` 模板。
+
+### 调用日志 `.unity-llm/calls.log`
+
+MCP server 会把每次工具调用记一行 JSON:工具名、参数、返回体字符数、
+`approx_tokens`(字符数 / 4)、耗时。用来量化「查图谱 vs 让模型通读文件」到底省多少 token。
+超过 2 MB 自动轮转成 `calls.log.1`。设 `UNITY_LLM_NO_LOG=1` 关掉。
+
+```bash
+# 本次会话所有工具调用一共花了多少 token
+python -c "import json,sys;print(sum(json.loads(l)['approx_tokens'] for l in open(sys.argv[1],encoding='utf-8') if l.strip()))" /path/to/Proj/.unity-llm/calls.log
+```
 
 ## 接入各种 LLM
 
@@ -261,7 +272,7 @@ python tests/run_tests.py
 **同名方法跨类型误报的精度回归**、引用查找(含「方法级 refs 只返回该方法」)、组件清单、
 死代码误报控制、**方法组引用(`method_ref`)**、**解析器注释/字符串遮蔽回归**、
 悬空引用体检、上下文打包、MCP 握手与 `tools/call`、**增量更新(改/增/删)**
-共 **104 项断言 / 21 个测试组**。
+共 **106 项断言 / 21 个测试组**。
 
 ## 能力与局限(诚实声明)
 
@@ -305,7 +316,9 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 - **`deadcode --exclude`** 与 `.unity-llm.json` 的 `dead_code_exclude`。
 - **guid 告警更准**:不再笼统报警,直接指出常见原因是 `guidmap.tsv` 过期
   (导出之后新增的资产),`stats` 另外给出 `guid_warning_examples` 样例。
-- 测试从 65 项断言扩到 104 项 / 21 组。
+- **新增 `.unity-llm/calls.log`**:每次 MCP 工具调用的返回体大小与估算 token,
+  方便量化省了多少上下文(`UNITY_LLM_NO_LOG=1` 关闭)。
+- 测试从 65 项断言扩到 106 项 / 21 组。
 
 ### 0.3.0
 
@@ -323,7 +336,7 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 104 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 106 项断言全绿。
 
 ## License
 

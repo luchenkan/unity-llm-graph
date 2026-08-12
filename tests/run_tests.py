@@ -276,6 +276,14 @@ def test_mcp_smoke():
     check("未知工具走 isError", call4["result"].get("isError") is True,
           str(call4))
     proc.kill()
+    log = os.path.join(FIXTURE, ".unity-llm", "calls.log")
+    lines = [json.loads(x) for x in open(log, encoding="utf-8")
+             if x.strip()] if os.path.exists(log) else []
+    check("calls.log 记录了工具调用", len(lines) >= 4, str(len(lines)))
+    check("calls.log 带返回体大小/估算 token",
+          any(r["tool"] == "unity_impact" and r["chars"] > 0
+              and r["approx_tokens"] == r["chars"] // 4 for r in lines),
+          str(lines[:2]))
 
 
 def test_update():

@@ -12,7 +12,9 @@ Cline 等所有支持 MCP stdio 的客户端。
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 from typing import Any, Callable, Dict
 
 from . import __version__
@@ -173,6 +175,36 @@ def _ok_text(payload: Any, compact: bool = True) -> Dict:
     return {"content": [{"type": "text", "text": text}]}
 
 
+CALL_LOG = "calls.log"
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _log_call(project_root: str, name: str, args: Dict,
+              out_chars: int, seconds: float, error: str = "") -> None:
+    """把每次工具调用的返回体大小记进 .unity-llm/calls.log。
+
+    用途:量化「用图谱查 vs 让模型通读文件」到底省多少 token
+    (out_chars / 4 ≈ token 数)。设环境变量 UNITY_LLM_NO_LOG=1 关掉。
+    """
+    if os.environ.get("UNITY_LLM_NO_LOG"):
+        return
+    try:
+        path = os.path.join(project_root, graph.DB_DIR, CALL_LOG)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > _LOG_MAX_BYTES:
+            os.replace(path, path + ".1")
+        rec = {"t": int(time.time()), "tool": name,
+               "args": {k: v for k, v in args.items() if k != "paths"},
+               "chars": out_chars, "approx_tokens": out_chars // 4,
+               "seconds": round(seconds, 3)}
+        if error:
+            rec["error"] = error
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 日志是附赠品,永远不能影响工具调用
+
+
 def make_dispatcher(project_root: str) -> Callable[[str, Dict], Any]:
     def need_graph():
         if not graph.has_graph(project_root):
@@ -256,11 +288,18 @@ def serve(project_root: str) -> None:
             _send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
         elif method == "tools/call":
             params = req.get("params", {})
+            tool = params.get("name", "")
+            call_args = params.get("arguments", {}) or {}
+            t0 = time.time()
             try:
-                result = dispatch(params.get("name", ""),
-                                  params.get("arguments", {}) or {})
-                _send({"jsonrpc": "2.0", "id": rid, "result": _ok_text(result)})
+                result = dispatch(tool, call_args)
+                payload = _ok_text(result)
+                _log_call(project_root, tool, call_args,
+                          len(payload["content"][0]["text"]), time.time() - t0)
+                _send({"jsonrpc": "2.0", "id": rid, "result": payload})
             except Exception as e:  # 工具错误按 MCP 规范走 isError
+                _log_call(project_root, tool, call_args, 0,
+                          time.time() - t0, error=str(e))
                 _send({"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": f"错误: {e}"}],
                     "isError": True,
