@@ -28,7 +28,9 @@ import time
 from typing import Dict, List, Optional, Set, Tuple
 
 from . import __version__
-from .meta import build_guid_map, iter_assets, is_external
+from .meta import (GUID_MAP_FILE, HEX_GUID_RE, PROJECT_VERSION_FILE,
+                   _guid_of_meta, build_guid_map, detect_engine,
+                   guid_format_report, iter_assets, is_external)
 from .unity_yaml import parse_unity_yaml
 from .csharp import parse_csharp, short_type
 
@@ -167,12 +169,67 @@ def _connect_path(path: str) -> sqlite3.Connection:
     return conn
 
 
+BUILD_TIME_HINT = ("耗时随项目规模/机器/磁盘波动很大 —— 本项目实测 1~9 分钟都出现过,"
+                   "stderr 有分阶段进度,没输出才是卡住")
+
+
+GUIDMAP_EXPORT_HINT = (
+    "先在 Unity 里导出 guid 映射表,否则脚本挂载点会全查成 0:\n"
+    "  菜单 Tools → unity-llm → Dump GUID Map(tools/UnityLlmGuidDump.cs 复制到 Assets/Editor/),\n"
+    "  或用 Unity MCP 的 execute_code 直接跑:遍历 AssetDatabase.GetAllAssetPaths(),\n"
+    "  把 AssetPathToGUID(path) + '\\t' + path 写进 <项目>/.unity-llm/guidmap.tsv。")
+
+
+def guidmap_missing(project_root: str, sample: int = 400) -> bool:
+    """本项目的 .meta guid 被重写过、且还没导出 guidmap.tsv?
+
+    抽样判断,别为了一句提示去全量扫 3 万个 .meta。
+    """
+    root = os.path.abspath(project_root)
+    if os.path.exists(os.path.join(root, GUID_MAP_FILE)):
+        return False
+    seen = nonstd = 0
+    for dirpath, dirnames, filenames in os.walk(os.path.join(root, "Assets")):
+        for fn in filenames:
+            if not fn.endswith(".meta"):
+                continue
+            g = _guid_of_meta(os.path.join(dirpath, fn))
+            if g:
+                seen += 1
+                if not HEX_GUID_RE.match(g):
+                    nonstd += 1
+            if seen >= sample:
+                return nonstd > seen * 0.02
+    return seen > 0 and nonstd > seen * 0.02
+
+
+def guidmap_hint(project_root: str) -> str:
+    """建图前的 guidmap 提示;不需要就返回空串,不占上下文。"""
+    return GUIDMAP_EXPORT_HINT if guidmap_missing(project_root) else ""
+
+
+def build_command(project_root: str) -> str:
+    """给用户的建图命令。
+
+    用 sys.executable + 当前 PYTHONPATH,保证复制即可跑:
+    unity_llm 常常只在 MCP 那个 venv 里可导入,提示 `python -m unity_llm`
+    会让用户撞上 No module named unity_llm。--project 用相对路径 `.`。
+    """
+    py = sys.executable or "python"
+    pp = os.environ.get("PYTHONPATH", "")
+    # 命令里带了 cd,PYTHONPATH 必须转绝对,否则相对项(".")换目录后就失效
+    if pp:
+        pp = os.pathsep.join(os.path.abspath(p) for p in pp.split(os.pathsep) if p)
+    prefix = f'PYTHONPATH="{pp}" ' if pp else ""
+    return (f'cd "{os.path.abspath(project_root)}" && '
+            f'{prefix}"{py}" -m unity_llm build --project .')
+
+
 def connect(project_root: str) -> sqlite3.Connection:
     path = db_path(os.path.abspath(project_root))
     if not os.path.exists(path):
         raise RuntimeError(
-            "图谱不存在,请先运行: "
-            f"python -m unity_llm build --project \"{os.path.abspath(project_root)}\"")
+            "图谱不存在,请先运行: " + build_command(project_root))
     return _connect_path(path)
 
 
@@ -444,18 +501,45 @@ def _propagate_mono(cur) -> int:
 
 
 def build(project_root: str, verbose: bool = False,
-          include_external_code: bool = True) -> dict:
+          include_external_code: bool = True,
+          allow_degraded_guid: bool = False) -> dict:
     """全量构建图谱。返回统计信息 dict。"""
     root = os.path.abspath(project_root)
     os.makedirs(os.path.join(root, DB_DIR), exist_ok=True)
     t0 = time.time()
     prog = _Progress(verbose)
-    prog.log("开始全量建图(中型项目约 8-10 分钟,stderr 有进度,不是卡住)")
+    prog.log("开始全量建图(" + BUILD_TIME_HINT + ")")
+
+    # 建表前先播报引擎:团结引擎和国际版 Unity 的 .meta guid 规则不同,
+    # 这直接决定要不要先导 guidmap.tsv,得让人在等 1 分钟之前就知道。
+    engine = detect_engine(root)
+    if engine["engine"] == "tuanjie":
+        prog.log(f"[0/6] 引擎: 团结引擎 {engine['version']}"
+                 f"(Tuanjie {engine.get('tuanjie_version', '?')})"
+                 " —— .meta guid 可能被重写,依赖 guidmap.tsv")
+    else:
+        prog.log(f"[0/6] 引擎: Unity {engine['version'] or '未识别'}(国际版)")
 
     prog.log("[1/6] 扫描 .meta 建立 guid 映射")
     guid_map, guid_source = build_guid_map(
         root, on_tick=lambda n: prog.maybe(n, 0, "[1/6] .meta"))
     prog.log(f"[1/6] guid 映射完成 {len(guid_map)} 条")
+    guid_fmt = guid_format_report(guid_map)
+    # 团结引擎/加密 .meta 的项目:meta 里的 guid 被重写成非 hex,而 prefab 的
+    # m_Script guid 仍是明文 hex,两边对不上 -> 脚本挂载点会静默查成 0。
+    # 一个挂载点全空的图比没有图更危险(会得出「这脚本没人用」的错误结论),
+    # 所以这里直接拒绝出图,除非调用方明确要一个降级的图。
+    if guid_fmt["nonstandard"] and "guidmap.tsv" not in guid_source:
+        ratio = guid_fmt["nonstandard"] / max(1, guid_fmt["total"])
+        msg = (f"{guid_fmt['nonstandard']}/{guid_fmt['total']} 个 .meta 的 guid "
+               "不是 32 位 hex(.meta 被加密/重写,常见于团结引擎)。"
+               "prefab 里的 guid 仍是明文,两边对不上,脚本挂载点会查成 0。\n"
+               + GUIDMAP_EXPORT_HINT)
+        if ratio > 0.02 and not allow_degraded_guid:
+            raise RuntimeError(
+                "拒绝建图:" + msg +
+                "\n(确实想要一个挂载点不可用的降级图谱:build --allow-degraded-guid)")
+        prog.log("[1/6] 警告: " + msg)
 
     final_path = db_path(root)
     building_path = final_path + ".building"
@@ -562,7 +646,9 @@ def build(project_root: str, verbose: bool = False,
     stats["confidence"] = _resolve_calls(cur, progress=prog)
 
     for k, v in (("built_at", str(int(time.time()))), ("version", __version__),
-                 ("guid_source", guid_source)):
+                 ("guid_source", guid_source),
+                 ("engine", engine["engine"]),
+                 ("engine_version", engine["version"])):
         cur.execute("INSERT OR REPLACE INTO meta_kv(key, value) VALUES (?,?)",
                     (k, v))
     # 批量插入后再建索引,避免每行维护 B-tree。
@@ -572,6 +658,10 @@ def build(project_root: str, verbose: bool = False,
     conn.close()
     os.replace(building_path, final_path)
     stats["guid_source"] = guid_source
+    stats["engine"] = engine["engine"]
+    stats["engine_version"] = engine["version"]
+    stats["guid_nonstandard"] = guid_fmt["nonstandard"]
+    stats["guid_total"] = guid_fmt["total"]
     stats["seconds"] = round(time.time() - t0, 2)
     prog.log(
         f"完成 {stats['seconds']}s  assets={stats['assets']} "

@@ -46,6 +46,37 @@ EXTERNAL_SEGMENTS = {
 
 GUID_MAP_FILE = os.path.join(".unity-llm", "guidmap.tsv")
 
+# 引擎识别:团结引擎(Tuanjie,Unity 中国版)和国际版 Unity 的 .meta guid 不一样。
+# 国际版:32 位 hex,写死在 .meta 里,磁盘文本就是权威。
+# 团结引擎:资产保护会把 .meta 的 guid 重写成 Base64 长串,而 prefab/scene 里
+#          m_Script 存的仍是引擎内部那份 hex guid —— 两边对不上,只能靠
+#          AssetDatabase 导出 guidmap.tsv 才能把挂载点接上。
+PROJECT_VERSION_FILE = os.path.join("ProjectSettings", "ProjectVersion.txt")
+
+
+def detect_engine(root: str) -> Dict[str, str]:
+    """判定项目用的是团结引擎还是国际版 Unity。
+
+    两个信号:`m_TuanjieEditorVersion` 字段,以及版本号里的 `t` 后缀
+    (如 2022.3.62t4)。识别不出来就当国际版。
+    """
+    out = {"engine": "unity", "version": ""}
+    path = os.path.join(root, PROJECT_VERSION_FILE)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return out
+    m = re.search(r"^m_EditorVersion:\s*(\S+)", text, re.MULTILINE)
+    if m:
+        out["version"] = m.group(1)
+    tj = re.search(r"^m_TuanjieEditorVersion:\s*(\S+)", text, re.MULTILINE)
+    if tj or re.match(r"^\d+\.\d+\.\d+t\d+", out["version"]):
+        out["engine"] = "tuanjie"
+        if tj:
+            out["tuanjie_version"] = tj.group(1)
+    return out
+
 # 项目级配置(可选,JSON 而非 TOML:tomllib 要 Python 3.11,这里保持 3.9 兼容)
 CONFIG_FILE = ".unity-llm.json"
 _CONFIG_CACHE: Dict[str, Dict] = {}

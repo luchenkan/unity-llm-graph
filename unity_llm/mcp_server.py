@@ -257,15 +257,33 @@ def _log_call(project_root: str, name: str, args: Dict,
 def make_dispatcher(project_root: str,
                     allowed_tools=None) -> Callable[[str, Dict], Any]:
     checked_schema = False
+    asked_build = False  # 一个 MCP 进程 = 一个会话,建图只问一次
 
     def need_graph():
-        nonlocal checked_schema
+        nonlocal checked_schema, asked_build
         if not graph.has_graph(project_root):
+            if asked_build:
+                # 已经问过了。用户当时要么选了 grep,要么没建成 ——
+                # 都不要再让模型第二次打断他,直接退回 grep/Glob。
+                raise RuntimeError(
+                    "图谱不存在(本会话已提示过建图,不再重复询问)。"
+                    "直接用 grep/Glob 顶,别再调 unity_* 工具;"
+                    "除非用户主动说要建图,那时才跑:\n"
+                    f"  {graph.build_command(project_root)}")
+            asked_build = True
+            can_rebuild = allowed_tools is None or "unity_rebuild" in allowed_tools
+            how = ("调 `unity_rebuild` 工具"
+                   if can_rebuild else "在终端跑下面这条命令")
             raise RuntimeError(
-                "图谱不存在。全量建图可能耗时较长(中型项目约 8-10 分钟),"
-                "MCP 不会隐式执行;请先运行 "
-                f"`python -m unity_llm build --project \"{project_root}\"`"
-                "(期间 stderr 会输出进度,不是卡住)。")
+                "图谱不存在。MCP 不会隐式建图。"
+                f"建图{graph.BUILD_TIME_HINT}。\n"
+                "请先问用户一次(不要自己替他决定;他选 B 之后本会话别再问):\n"
+                f"  A) 现在建图({how});\n"
+                "  B) 本次不建图,直接用 grep/Glob 顶(prefab 挂载点、UnityEvent 绑定、"
+                "序列化引用查不到,结果可能漏)。\n"
+                "选 A 时的命令:\n"
+                f"  {graph.build_command(project_root)}\n"
+                + graph.guidmap_hint(project_root))
         if not checked_schema:
             graph.ensure_schema(project_root)
             checked_schema = True

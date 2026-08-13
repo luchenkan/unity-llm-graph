@@ -14,7 +14,7 @@ import json
 import os
 from typing import Dict, List, Optional, Set
 
-from .graph import connect, has_graph
+from .graph import connect, has_graph, build_command as graph_build_command
 from .unity_yaml import CLASS_NAMES
 
 DEFAULT_LIMIT = 60
@@ -25,7 +25,7 @@ _CONF_ORDER = {"high": 0, "medium": 1, "low": 2}
 def _require_graph(project_root: str) -> None:
     if not has_graph(project_root):
         raise RuntimeError(
-            "图谱不存在,请先运行: python -m unity_llm build --project <path>")
+            "图谱不存在,请先运行: " + graph_build_command(project_root))
 
 
 def _cap(items: List, limit: int, key=None) -> Dict:
@@ -644,6 +644,13 @@ def components(project_root: str, target: str,
         out["summary"] = {"mounted_on": len(items)}
         if cap["truncated"]:
             out["summary"]["truncated"] = cap["truncated"]
+        if not items:
+            # 0 挂载点有两种可能:真没人挂,或 guid 映射坏了(.meta 被加密、
+            # 没导 guidmap.tsv)。后者必须说出来,不然会被当成"这脚本没被用"。
+            health = _guid_health(conn)
+            if health.get("risky"):
+                out["summary"]["hint"] = (
+                    "挂载点 0 可能不可信:" + health["message"])
     conn.close()
     return out
 

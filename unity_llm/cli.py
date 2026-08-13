@@ -32,7 +32,8 @@ def _print(args, obj) -> None:
 
 def cmd_build(args) -> int:
     stats = graph.build(_project(args), verbose=True,
-                        include_external_code=not args.no_external_code)
+                        include_external_code=not args.no_external_code,
+                        allow_degraded_guid=args.allow_degraded_guid)
     _print(args, {"ok": True, "stats": stats})
     return 0
 
@@ -165,11 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="包含 3rd/Plugins/Packages 等第三方目录的结果")
 
     sp = sub.add_parser("build",
-                        help="构建/重建依赖图谱(中型项目约 8-10 分钟,stderr 有进度)")
+                        help="构建/重建依赖图谱(耗时随项目/机器波动,"
+                             "分钟量级,stderr 有分阶段进度)")
     add_project(sp)
     sp.add_argument("--no-external-code", action="store_true",
                     help="不解析第三方目录里的 C#(建图更快,但第三方对你代码的"
                          "调用会看不见)")
+    sp.add_argument("--allow-degraded-guid", action="store_true",
+                    help="即使 .meta guid 被重写、又没有 guidmap.tsv 也照样建图"
+                         "(挂载点/序列化引用会查成 0,一般别用)")
     sp.set_defaults(func=cmd_build)
 
     sp = sub.add_parser("stats", help="图谱统计信息")
