@@ -123,6 +123,15 @@ CREATE TABLE IF NOT EXISTS dotted_members (
     name TEXT NOT NULL,         -- 被 `x.Name` 形式访问过的成员名(非调用)
     file TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS objects (
+    src_guid TEXT NOT NULL,     -- 所属资产(prefab/scene/asset)guid
+    fileid INTEGER NOT NULL,    -- 本地 fileID(单个文件内唯一)
+    class_id INTEGER NOT NULL,  -- 1=GameObject 4=Transform 114=MonoBehaviour ...
+    name TEXT NOT NULL DEFAULT '',        -- GameObject 的 m_Name(组件通常为空)
+    go_fileid INTEGER NOT NULL DEFAULT 0, -- 组件/Transform 所属 GameObject 的 fileID
+    father_fileid INTEGER NOT NULL DEFAULT -1, -- Transform 的父 Transform fileID(0=根,-1=非 Transform)
+    script_guid TEXT NOT NULL DEFAULT ''  -- MonoBehaviour 的 m_Script guid
+);
 """
 
 INDEX_SCHEMA = """
@@ -138,6 +147,8 @@ CREATE INDEX IF NOT EXISTS idx_members_owner ON members(owner);
 CREATE INDEX IF NOT EXISTS idx_types_name ON types(name);
 CREATE INDEX IF NOT EXISTS idx_events_method ON events(method);
 CREATE INDEX IF NOT EXISTS idx_deleted_path ON deleted_assets(path);
+CREATE INDEX IF NOT EXISTS idx_objects_src ON objects(src_guid);
+CREATE INDEX IF NOT EXISTS idx_objects_go ON objects(src_guid, go_fileid);
 """
 
 # 同名方法在超过这么多类型里出现,就算「热名字」:接收者类型未知时
@@ -338,10 +349,18 @@ def _insert_csharp(cur, text: str, rel: str, guid: str, ext_flag: int) -> dict:
 def _insert_yaml(cur, text: str, rel: str, guid: str) -> dict:
     """解析并写入一个 Unity YAML 资产,返回 {refs, events} 计数。"""
     yf = parse_unity_yaml(text)
-    n = {"refs": 0, "events": 0}
+    n = {"refs": 0, "events": 0, "objects": 0}
     for doc in yf.docs:
         go_name = yf.game_object_name(doc.go_fileid) if doc.go_fileid else ""
         ctx = go_name or doc.name or doc.class_name
+        # fileID 对象图:每个 doc 都是一条本地对象记录,供层级树/组件挂载查询
+        cur.execute(
+            "INSERT INTO objects(src_guid, fileid, class_id, name, go_fileid,"
+            " father_fileid, script_guid) VALUES (?,?,?,?,?,?,?)",
+            (guid, doc.file_id, doc.class_id, doc.name,
+             doc.go_fileid or 0, doc.father_fileid if doc.father_fileid is not None else -1,
+             doc.script_guid or ""))
+        n["objects"] += 1
         if doc.refs:
             cur.executemany(
                 "INSERT INTO refs(src_guid, src_path, field, dst_guid,"
@@ -532,6 +551,9 @@ def update_files(project_root: str, rel_paths) -> dict:
                            ("calls", "file"), ("refs", "src_path"),
                            ("events", "src_path"), ("dotted_members", "file")):
             cur.execute(f"DELETE FROM {table} WHERE {col}=?", (rel,))
+        if old_asset:
+            cur.execute("DELETE FROM objects WHERE src_guid=?",
+                        (old_asset["guid"],))
         cur.execute("DELETE FROM assets WHERE path=?", (rel,))
         if not os.path.exists(abspath):
             if old_asset:

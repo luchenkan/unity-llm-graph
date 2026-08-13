@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-130%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-142%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / methods / calls / inheritance / engine lifecycle callbacks)
@@ -220,7 +220,7 @@ python -m unity_llm context --project /path/to/Proj --target Enemy --budget 1500
 | ------------------ | --------------------------------------------------------------- |
 | `unity_impact`     | 影响面分析:改了这个脚本/方法/prefab 会炸到谁(代码调用+继承、序列化引用传递闭包、UnityEvent 绑定三通道) |
 | `unity_refs`       | 谁引用了这个资产:哪些 prefab/scene/SO 的哪个字段、哪段代码(`file:line`)             |
-| `unity_components` | prefab/scene 挂了哪些脚本;反过来,某个脚本被哪些 prefab 的哪个 GameObject 挂载        |
+| `unity_components` | prefab/scene 挂了哪些脚本 + **GameObject 层级树(hierarchy)**;反过来,某个脚本被哪些 prefab 的哪个 GameObject 挂载 |
 | `unity_dead_code`  | Unity 感知死代码:排除生命周期回调、消息方法、字符串调用、**UnityEvent 绑定**、序列化字段、第三方目录   |
 | `unity_validate`   | 体检:指向不存在资产的悬空 guid(已排除引擎内置),以及 `.meta` guid 被改写工具处理过的告警         |
 | `unity_context`    | token 预算内的精简上下文包(签名 + 依赖),改代码前先调它                               |
@@ -402,7 +402,7 @@ python tests/run_tests.py
 死代码误报控制、**方法组引用(`method_ref`)**、**解析器注释/字符串遮蔽回归**、
 悬空引用体检、上下文打包、MCP 握手与 `tools/call`、**增量更新(改/增/删)**
 并覆盖 partial、namespace 重名、原子 build、tombstone、MCP profile 和严格
-token 预算。共 **130 项断言 / 24 个测试组**。
+token 预算。共 **142 项断言 / 25 个测试组**。
 
 ## 能力与局限(诚实声明)
 
@@ -421,6 +421,23 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
 
 ## Changelog
+
+### 0.7.0
+
+让图谱覆盖 Editor MCP 的「列层级 / 列组件」查询,补齐一直标「未实现」的
+fileID 对象图:
+
+- **新增 `objects` 表**:prefab/scene/asset 里每个 YAML 文档都是一条本地对象记录
+  (fileID / classID / GameObject 名 / 所属 GameObject / Transform 父节点 / 脚本 guid)。
+- **`unity_components` 返回 `hierarchy`**:给 prefab/scene 时,额外输出缩进的
+  GameObject 层级树,每个节点下列出挂载的组件(MonoBehaviour 显示脚本文件名)。
+  层级关系来自 Transform 的 `m_Father`,组件通过 `m_GameObject` 反挂 —— 这层耦合
+  grep 和 AST 都看不见,以前只能靠 Editor MCP 实时列出来。
+- **无 Transform 的 GameObject 也进树**(fixture 里 BattleCoreGO 那种),不会丢节点。
+- 组件反挂不依赖 GameObject 的 `m_Component` 列表(它可能不完整),用每个组件的
+  `m_GameObject` 字段,更稳健。
+- 新增多层级 fixture `UiPanel.prefab`(根→子→兄弟),测试扩到 **142 项断言 / 25 组**。
+- 定位:查结构用图谱,改结构用 Editor MCP(写操作仍不可替代)。
 
 ### 0.6.0
 
@@ -505,7 +522,9 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 - [x] 链式静态字段调用(`Type.Field.Method()`,含事件总线 / 单例)
 - [ ] 文件监听 daemon(免 hook,编辑器里手改也实时跟)
 - [x] UnityEvent / Inspector 事件绑定的 YAML 提取
-- [ ] Unity 本地 fileID 对象图 + prefab override `propertyPath` 语义
+- [x] Unity 本地 fileID 对象图(prefab/scene 的 GameObject 层级树 + 组件挂载,
+  `unity_components` 输出 `hierarchy`,替代 Editor MCP 列层级)
+- [ ] prefab override `propertyPath` 语义(嵌套 prefab 的字段覆盖)
 - [ ] AnimationEvent / Timeline Signal 静态入口
 - [ ] `transform.Find` 路径 ↔ 场景层级校验
 - [ ] Addressables / AssetBundle 分组分析
@@ -514,7 +533,7 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 130 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 142 项断言全绿。
 
 历次模型评审记录见 [REVIEWS.md](REVIEWS.md)(Kimi k3 / Claude Opus 5 /
 Cursor Grok 4.6 / GPT-5.6 Sol)。下一轮请对着真实项目和 `calls.log` 审,

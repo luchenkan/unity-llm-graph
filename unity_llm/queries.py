@@ -11,9 +11,11 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Dict, List, Optional, Set
 
 from .graph import connect, has_graph
+from .unity_yaml import CLASS_NAMES
 
 DEFAULT_LIMIT = 60
 GOOD_CONF = ("high", "medium")
@@ -44,7 +46,7 @@ _PREFERRED_EXTS = (".cs", ".prefab", ".unity", ".asset", ".controller")
 
 
 def _type_candidates(conn, t: str, limit: int = 6) -> List[Dict]:
-    """前缀同名的类型候选(Shop -> ShopModel/ShopController...)。"""
+    """前缀同名的类型候选(Shop -> ShopPage/ShopController/ShopView...)。"""
     rows = conn.execute(
         "SELECT full_name, kind, file FROM types WHERE name LIKE ?"
         " ORDER BY external, length(name) LIMIT ?", (t + "%", limit)).fetchall()
@@ -496,6 +498,86 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
 
 # ---------------------------------------------------------------- components
 
+def _component_label(row) -> str:
+    """一条组件对象记录的展示名:MonoBehaviour 显示脚本文件,其余显示类名。"""
+    if row["class_id"] == 114:  # MonoBehaviour
+        if row["path"]:
+            return "MonoBehaviour: " + os.path.basename(row["path"])
+        return "MonoBehaviour: " + (row["script_guid"][:8] if row["script_guid"] else "?")
+    return CLASS_NAMES.get(row["class_id"], f"Class{row['class_id']}")
+
+
+# 参与层级建树的变换节点:Transform 与它的子类 RectTransform(UI 项目绝大多数节点)。
+TRANSFORM_CLASS_IDS = (4, 224)
+
+
+def _build_hierarchy_text(conn, src_guid: str):
+    """把 prefab/scene 的 fileID 对象图还原成 GameObject 层级树(缩进文本)。
+
+    层级关系来自 Transform/RectTransform 的 m_Father(fileID=0 是根),GameObject
+    名来自 m_Name,组件通过 m_GameObject 反挂到所属 GameObject。这是 grep / AST
+    都看不见、只能靠 Editor MCP 实时列出来的一层 —— 这里从静态 YAML 还原。
+    嵌套 prefab 的子节点 Transform 在别的文件里,本文件视角下它们的父级不可见,
+    会作为根列出(不丢节点),嵌套数通过 summary.nested_prefabs 提示。
+    返回 (缩进文本, GameObject 数)。对象图缺失(旧 graph.db 未重建)时返回空。
+    """
+    if not _has_table(conn, "objects"):
+        return "", 0
+    rows = conn.execute(
+        "SELECT o.fileid, o.class_id, o.name, o.go_fileid, o.father_fileid,"
+        " o.script_guid, a.path FROM objects o"
+        " LEFT JOIN assets a ON a.guid=o.script_guid WHERE o.src_guid=?",
+        (src_guid,)).fetchall()
+    if not rows:
+        return "", 0
+    go_name: Dict[int, str] = {}
+    transforms: Dict[int, tuple] = {}   # 变换节点 fileid -> (go_fileid, father_fileid)
+    comps: Dict[int, List[str]] = {}
+    for r in rows:
+        if r["class_id"] == 1:
+            go_name[r["fileid"]] = r["name"] or "(unnamed)"
+        elif r["class_id"] in TRANSFORM_CLASS_IDS:
+            transforms[r["fileid"]] = (r["go_fileid"], r["father_fileid"])
+        elif r["go_fileid"]:
+            comps.setdefault(r["go_fileid"], []).append(_component_label(r))
+
+    children: Dict[int, List[int]] = {}
+    transform_go = {go for go, _ in transforms.values()}
+    roots: Set[int] = set()
+    for go, father in transforms.values():
+        if go not in go_name:
+            continue  # 孤儿变换节点(m_GameObject 指向的 GO 在嵌套 prefab 里)
+        if father == 0:
+            roots.add(go)
+            continue
+        parent = transforms.get(father)
+        if parent is None or parent[0] not in go_name:
+            # 父变换节点不在本文件(嵌套 prefab):本文件视角下它是根,不丢节点
+            roots.add(go)
+        else:
+            children.setdefault(parent[0], []).append(go)
+    # 变换节点在子 prefab 里的 GameObject:本文件内没有它的变换信息,也是根
+    for go in go_name:
+        if go not in transform_go:
+            roots.add(go)
+
+    for k in children:
+        children[k].sort(key=lambda g: go_name.get(g, ""))
+    lines: List[str] = []
+
+    def render(go: int, indent: int):
+        pad = "  " * indent
+        lines.append(pad + go_name.get(go, "?"))
+        for label in sorted(set(comps.get(go, []))):
+            lines.append(pad + "  - " + label)
+        for child in children.get(go, []):
+            render(child, indent + 1)
+
+    for go in sorted(roots, key=lambda g: go_name.get(g, "")):
+        render(go, 0)
+    return "\n".join(lines), len(go_name)
+
+
 def components(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict:
     """prefab/scene 上挂了哪些脚本(m_Script 边),或某个脚本被谁挂载。"""
     conn = connect(project_root)
@@ -516,7 +598,17 @@ def components(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Di
                   "on": r["ctx"]} for r in rows]
         cap = _cap(items, limit)
         out["scripts"] = cap["items"]
-        out["summary"] = {"scripts": len(items)}
+        hierarchy, go_count = _build_hierarchy_text(conn, node["guid"])
+        nested = 0
+        if _has_table(conn, "objects"):
+            nested = conn.execute(
+                "SELECT count(*) FROM objects WHERE src_guid=? AND class_id=1001",
+                (node["guid"],)).fetchone()[0]
+        out["summary"] = {"scripts": len(items), "game_objects": go_count}
+        if nested:
+            out["summary"]["nested_prefabs"] = nested
+        if hierarchy:
+            out["hierarchy"] = hierarchy
         if cap["truncated"]:
             out["summary"]["truncated"] = cap["truncated"]
     else:

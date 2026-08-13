@@ -2,7 +2,7 @@
 
 Brief for later reviewers. Do not treat README or the 5-script fixture as the product.
 
-Framework: **unity-llm-graph** `0.6.0`  
+Framework: **unity-llm-graph** `0.7.0`  
 Repo: https://github.com/luchenkan/unity-llm-graph (private)  
 Constraint: zero runtime deps, Python ≥ 3.9, stdlib only.
 
@@ -28,6 +28,7 @@ Two MCP servers can and should run together: this one answers “what is coupled
 | 4 | Claude Opus 5 | Fuzzy-resolve false negatives, internal vs external callers, `dead_code_exclude`, `method_ref`, field `code_used`, comment/string masking, CI, `calls.log`. |
 | 5 | Cursor Grok 4.6 | Reviewed against a real ~37.5k-asset project **and** MCP call logs, not the fixture. Then patched 0.5.0. |
 | 6 | GPT-5.6 Sol | Re-prioritized correctness before token claims; patched namespace resolution, dead-code false negatives, deletion tombstones, strict context budgets, MCP profiles, and atomic builds for 0.6.0. |
+| 7 | DeepSeek-V4-Pro | Reviewed **adoption**, not the fixture: read a production project's `calls.log`, token ledger, hook config, and a competing Editor MCP. Found Grok 4.6's diagnosis was still unfixed, then patched 0.7.0 to take the Editor MCP's "list hierarchy / components" query off the table. |
 
 Round 5 is the first pass that measured **which tools models actually invoked**, and that rejected encoding one game’s bus type into the engine.
 
@@ -48,18 +49,21 @@ Round 5 is the first pass that measured **which tools models actually invoked**,
 - **Cursor ≠ Claude Code MCP paths.** Project-root `.mcp.json` does not mean Cursor loaded the server.
 - Round 5 first pass over-fit a project event bus name into MCP copy. That was reverted: the engine now matches **`Type.Field.Method()`** (PascalCase type, any method), kind `field_call`. Old kind `relay` is still read for stale DBs.
 
-## Current shape (`0.6.0`)
+## Current shape (`0.7.0`)
 
 ```
 meta.py        guid ← .meta and/or guidmap.tsv
 unity_yaml.py  guid refs + UnityEvent + GameObject name via m_GameObject
+               + fileID object graph (Transform m_Father, component m_GameObject)
 csharp.py      types/methods/fields, lifecycle, string APIs, method_ref, field_call
 graph.py       SQLite union + call resolution + is_mono inheritance walk
-queries.py     impact / refs / components / deadcode / find / validate
+               + objects table (fileID object graph)
+queries.py     impact / refs / components (with hierarchy tree) / deadcode /
+               find / validate
 mcp_server.py  10 tools split into core/full/admin profiles
 ```
 
-Tests: 130 assertions / 24 groups on `tests/fixtures/SampleProject`.
+Tests: 142 assertions / 25 groups on `tests/fixtures/SampleProject`.
 
 ## Open questions for the next model
 
@@ -111,3 +115,41 @@ of avoided full-file reads**, not measured API billing. MCP schema/input and par
 remain outside that estimate.
 
 Review completed by **GPT-5.6 Sol**.
+
+## Round 7 — adoption review, not another fixture pass
+
+Reviewed the **same real production project** Round 5 measured (a ~37.5k-asset
+project) the way Round 5 asked: read `.unity-llm/calls.log`, the token ledger, hook
+config, and the installed Editor MCP. Findings, in order of severity:
+
+1. **Grok 4.6's diagnosis was still unfixed.** `calls.log` was dominated by graph
+   refresh (`unity_update`, roughly two thirds of calls) plus a few `unity_find`, with
+   **zero** `unity_refs` / `unity_components` calls. The two tools grep cannot replace
+   were never called.
+2. **The token ledger over-credits the graph.** The running total mostly came from
+   grep, read-discipline, and the Editor MCP's `execute_code`/`SerializedObject` — not
+   from graph queries. `baseline - spent` is an upper bound, not the framework's
+   contribution.
+3. **The Editor MCP is eating the serialized-ref use case.** Models listed prefab
+   hierarchy/components via `execute_code` instead of `unity_components`, because the
+   graph could not answer "what does this prefab look like".
+
+Fix shipped in `0.7.0`: parse the `fileID` object graph into an `objects` table and make
+`unity_components` emit an indented GameObject hierarchy tree (Transform `m_Father` for
+parenting, component `m_GameObject` for mounting, MonoBehaviour `m_Script` for script
+names). The query half of the Editor MCP is now redundant; the mutation half
+(create/delete/modify GameObject, save prefab, build, refresh) is explicitly out of
+scope and must stay with the Editor MCP.
+
+Rule file updated with a hard constraint: structure queries go to the graph, mutations
+go to the Editor MCP. This is the "强制约束" the prior rounds never enforced — a rules
+row is a hint, not a guarantee, so the tool now wins the query race on merit instead of
+asking the model to remember.
+
+Still deliberately not implemented (unchanged from Round 6):
+
+- prefab override `propertyPath` semantics (nested prefab field overrides).
+- AnimationEvent, Timeline Signal, Addressables/YooAsset semantic graphs.
+- Roslyn-quality `using` alias/generic/extension-method resolution.
+
+Review completed by **DeepSeek-V4-Pro**.

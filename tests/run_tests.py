@@ -68,7 +68,7 @@ def test_build():
     stats = graph.build(FIXTURE)
     check("脚本数", stats["scripts"] == 10, str(stats))
     check("类型数", stats["types"] == 13, str(stats))
-    check("YAML 资产数", stats["yaml_assets"] == 4, str(stats))
+    check("YAML 资产数", stats["yaml_assets"] == 5, str(stats))
     check("序列化引用数>=5", stats["refs"] >= 5, str(stats))
     check("资产数>=9", stats["assets"] >= 9, str(stats))
     check("UnityEvent 绑定==1", stats["events"] == 1, str(stats))
@@ -328,7 +328,7 @@ def test_update():
         check("两个文件更新成功且无错误",
               len(r["updated"]) == 2 and not r["errors"], str(r))
         check("增量更新同步 schema 版本",
-              queries.stats(dst)["version"] == "0.6.0")
+              queries.stats(dst)["version"] == "0.7.0")
         d = queries.dead_code(dst)
         methods = {m["method"] for m in d["dead_methods"]}
         check("新方法名进入死代码", any("NewDeadMethod" in m for m in methods),
@@ -685,6 +685,36 @@ def test_atomic_build():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_hierarchy():
+    print("[25] 层级树(fileID 对象图)")
+    # 多层 Transform:UIRoot 下挂 Panel 和 Button 两个子节点
+    r = queries.components(FIXTURE, "Assets/Prefabs/UiPanel.prefab")
+    hier = r.get("hierarchy", "")
+    check("层级树存在", bool(hier), str(r))
+    lines = [l for l in hier.split("\n") if l.strip()]
+    check("根节点是 UIRoot", lines[0].strip() == "UIRoot", str(lines))
+    check("Panel 缩进为子节点", "  Panel" in lines, str(lines))
+    check("Button 缩进为子节点", "  Button" in lines, str(lines))
+    check("Panel 挂 BattleCore.cs", "BattleCore.cs" in hier, str(hier))
+    check("Button 挂 Player.cs", "Player.cs" in hier, str(hier))
+    check("game_objects 计数为 3", r["summary"]["game_objects"] == 3,
+          str(r["summary"]))
+    check("RectTransform 是变换节点、不当组件泄漏", "- RectTransform" not in hier,
+          str(hier))
+    # 单层 Transform:Enemy 挂两个 MonoBehaviour
+    r2 = queries.components(FIXTURE, "Assets/Prefabs/Enemy.prefab")
+    h2 = r2.get("hierarchy", "")
+    check("Enemy 层级树根是 Enemy", h2.split("\n")[0].strip() == "Enemy", str(h2))
+    check("Enemy 挂 Enemy.cs 和 Player.cs",
+          "Enemy.cs" in h2 and "Player.cs" in h2, str(h2))
+    # 无 Transform 的 GameObject(BattleCoreGO)也要能显示
+    r3 = queries.components(FIXTURE, "Assets/Prefabs/BattleCore.prefab")
+    h3 = r3.get("hierarchy", "")
+    check("无 Transform 的 GO 也进层级树",
+          h3.split("\n")[0].strip() == "BattleCoreGO", str(h3))
+    check("BattleCoreGO 挂 BattleCore.cs", "BattleCore.cs" in h3, str(h3))
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -698,7 +728,7 @@ def main():
              test_caller_scope, test_deadcode_exclude, test_project_config,
              test_guid_warning_precision, test_method_ref,
              test_parser_masking, test_partial_and_relay,
-             test_correctness_hardening, test_atomic_build]
+             test_correctness_hardening, test_atomic_build, test_hierarchy]
     failed = 0
     for t in tests:
         try:

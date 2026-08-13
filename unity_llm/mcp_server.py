@@ -79,9 +79,11 @@ TOOLS = [
     },
     {
         "name": "unity_components",
-        "description": ("组件清单:给 prefab/scene 列出它挂了哪些脚本、挂在哪个 GameObject;"
+        "description": ("组件清单:给 prefab/scene 列出它挂了哪些脚本、挂在哪个 GameObject,"
+                        "并输出 GameObject 层级树(hierarchy,含父子关系与每个节点挂的组件)。"
                         "给脚本/类反过来列出被哪些 prefab/scene 的哪个 GameObject 挂载。"
-                        "这是 grep 做不到的,动序列化引用前优先用它而不是 unity_find。"),
+                        "这是 grep 做不到的,动 prefab/scene 前优先用它,"
+                        "不要用 Editor MCP 的 execute_code/FindGameObjects 去列层级。"),
         "inputSchema": {
             "type": "object",
             "properties": {

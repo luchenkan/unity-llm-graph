@@ -37,6 +37,10 @@ SCRIPT_RE = re.compile(
     r"^\s*m_Script:\s*\{fileID:\s*-?\d+,\s*guid:\s*(" + _GUID_BODY + r")",
     re.MULTILINE
 )
+# Transform 的父节点(fileID=0 表示根)。这是还原 GameObject 层级树的关键:
+# Transform 与 GameObject 一一对应,父子关系写在 Transform 的 m_Father 上,
+# 而不是 GameObject 上 —— 纯文本 grep 看不到这层耦合。
+FATHER_RE = re.compile(r"^\s*m_Father:\s*\{fileID:\s*(-?\d+)", re.MULTILINE)
 KEY_RE = re.compile(r"^\s{2,}([A-Za-z_]\w*):", re.MULTILINE)
 
 # UnityEvent 持久化绑定
@@ -90,6 +94,7 @@ class YamlDoc:
     name: str = ""
     script_guid: Optional[str] = None      # 仅 MonoBehaviour: 挂载的脚本 guid
     go_fileid: Optional[int] = None        # m_GameObject fileID,用来还原物体名
+    father_fileid: Optional[int] = None    # 仅 Transform: 父 Transform 的 fileID(0=根)
     refs: List[YamlRef] = field(default_factory=list)
     events: List[YamlEvent] = field(default_factory=list)
 
@@ -198,6 +203,9 @@ def parse_unity_yaml(text: str) -> UnityYamlFile:
             fid = int(gm.group(1))
             if fid:
                 doc.go_fileid = fid
+        fm = FATHER_RE.search(body)
+        if fm:
+            doc.father_fileid = int(fm.group(1))
         sm = SCRIPT_RE.search(body)
         if sm:
             doc.script_guid = sm.group(1)
