@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict
 
 from . import __version__
 from . import graph, queries, context as context_mod
+from .tokens import estimate_tokens
 
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -37,9 +38,9 @@ TOOLS = [
     {
         "name": "unity_impact",
         "description": ("影响面分析(改代码前先调它):修改某个脚本/方法/prefab 会炸到谁。"
-                        "三通道 —— C# 调用与继承(含 method_ref:Register(OnFoo) / "
-                        "evt += OnFoo 这种没有括号的回调注册;带接收者类型解析和置信度,"
-                        "并区分 scope: external 外部调用方 / internal 内部自调用)、"
+                        "短名即可,同名 partial 文件会自动合并。"
+                        "三通道 —— C# 调用与继承(含 method_ref、以及 "
+                        "Type.Field.Method() 链式静态字段/单例调用)、"
                         "prefab/scene/ScriptableObject 序列化引用(传递闭包)、"
                         "UnityEvent/按钮 onClick 绑定。后两者是普通代码图谱"
                         "(tree-sitter/AST)结构上看不见的 Unity 特有耦合。"
@@ -52,7 +53,7 @@ TOOLS = [
                 "depth": {"type": "integer", "default": 3,
                           "description": "资产级传递深度,默认 3"},
                 "include_low": _LOW,
-                "limit": {"type": "integer", "default": 60,
+                "limit": {"type": "integer", "default": 8,
                           "description": "每个分区最多返回条数"},
             },
             "required": ["target"],
@@ -60,41 +61,49 @@ TOOLS = [
     },
     {
         "name": "unity_refs",
-        "description": ("引用查找:哪些 prefab/场景/ScriptableObject 的哪个字段引用了它"
-                        "(含所在 GameObject),以及引用它的 C# 位置(file:line)。"
-                        "目标写成 Owner.Method 时只返回这个方法的引用;"
-                        "回调注册点以 kind=method_ref 出现。"),
+        "description": ("引用查找(改 prefab/scene/SO 前先调,grep 看不到):"
+                        "哪些 prefab/场景/ScriptableObject 的哪个字段、哪个 GameObject "
+                        "引用了它,以及引用它的 C# 位置(file:line)。"
+                        "目标写成 Owner.Method 或 Owner.Field 时只返回该项;"
+                        "回调注册点以 kind=method_ref 出现,"
+                        "Type.Field.Method() 链式调用以 kind=field_call 出现。"),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": _TARGET_DESC},
                 "include_low": _LOW,
-                "limit": {"type": "integer", "default": 60},
+                "limit": {"type": "integer", "default": 12},
             },
             "required": ["target"],
         },
     },
     {
         "name": "unity_components",
-        "description": ("组件清单:给 prefab/scene 就列出它挂了哪些脚本;"
-                        "给脚本/类就反过来列出它被哪些 prefab/scene 的哪个 GameObject 挂载。"),
+        "description": ("组件清单:给 prefab/scene 列出它挂了哪些脚本、挂在哪个 GameObject;"
+                        "给脚本/类反过来列出被哪些 prefab/scene 的哪个 GameObject 挂载。"
+                        "这是 grep 做不到的,动序列化引用前优先用它而不是 unity_find。"),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": _TARGET_DESC},
-                "limit": {"type": "integer", "default": 60},
+                "limit": {"type": "integer", "default": 20},
             },
             "required": ["target"],
         },
     },
     {
         "name": "unity_find",
-        "description": "按名字模糊搜索 C# 类型、成员和项目资产(第三方目录排在后面)。",
+        "description": ("按名字搜类型/成员/资产,返回精简索引(名+路径),不是全文。"
+                        "用来确认短名后再跟 unity_impact / unity_refs;"
+                        "不要拿它当 grep,大关键词会浪费 token。"),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "搜索关键词"},
-                "limit": {"type": "integer", "default": 30},
+                "kind": {"type": "string",
+                         "description": "可选 type / member / asset,默认三类都搜"},
+                "limit": {"type": "integer", "default": 5,
+                          "description": "每类最多条数,默认 5"},
             },
             "required": ["pattern"],
         },
@@ -115,7 +124,7 @@ TOOLS = [
                 "exclude": {"type": "array", "items": {"type": "string"},
                             "description": "额外排除的路径片段或前缀,如 "
                                            "[\"ART_TEST\", \"Assets/Demo\"]"},
-                "limit": {"type": "integer", "default": 60},
+                "limit": {"type": "integer", "default": 20},
             },
             "required": [],
         },
@@ -126,7 +135,7 @@ TOOLS = [
                         "已排除引擎内置资源),以及 .meta guid 被改写工具处理过的告警。"),
         "inputSchema": {
             "type": "object",
-            "properties": {"limit": {"type": "integer", "default": 60}},
+            "properties": {"limit": {"type": "integer", "default": 20}},
             "required": [],
         },
     },
@@ -152,9 +161,9 @@ TOOLS = [
     },
     {
         "name": "unity_update",
-        "description": ("增量更新图谱:你(或用户)修改/新增/删除了个别文件后调用,"
-                        "只重建这些文件的数据(秒级),不用全量 rebuild。"
-                        "传项目相对路径,如 Assets/Scripts/Enemy.cs。"),
+        "description": ("增量更新图谱:改了个别文件后调用,只重建这些文件(秒级)。"
+                        "传项目相对路径,如 Assets/Scripts/Enemy.cs。"
+                        "会话里也可不调,交给 git post-commit hook 批量刷新。"),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -165,6 +174,31 @@ TOOLS = [
         },
     },
 ]
+
+PROFILES = {
+    # 日常会话只暴露查询工具,避免把维护工具 schema 和错误选项塞进模型上下文。
+    "core": ("unity_impact", "unity_refs", "unity_components",
+             "unity_find", "unity_context"),
+    "full": tuple(t["name"] for t in TOOLS),
+    "admin": ("unity_stats", "unity_dead_code", "unity_validate",
+              "unity_rebuild", "unity_update"),
+}
+_DEFAULT_LIMITS = {
+    "unity_impact": 8,
+    "unity_refs": 12,
+    "unity_components": 20,
+    "unity_find": 5,
+    "unity_dead_code": 20,
+    "unity_validate": 20,
+}
+
+
+def tools_for_profile(profile: str) -> list:
+    names = set(PROFILES.get(profile, ()))
+    if not names:
+        raise ValueError(
+            f"未知 MCP profile: {profile};可选 {', '.join(PROFILES)}")
+    return [t for t in TOOLS if t["name"] in names]
 
 
 def _ok_text(payload: Any, compact: bool = True) -> Dict:
@@ -180,11 +214,13 @@ _LOG_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _log_call(project_root: str, name: str, args: Dict,
-              out_chars: int, seconds: float, error: str = "") -> None:
+              output_text: str, seconds: float, error: str = "",
+              resolved_kind: str = "") -> None:
     """把每次工具调用的返回体大小记进 .unity-llm/calls.log。
 
     用途:量化「用图谱查 vs 让模型通读文件」到底省多少 token
-    (out_chars / 4 ≈ token 数)。设环境变量 UNITY_LLM_NO_LOG=1 关掉。
+    (中日韩字符按 1 token,其余按约 4 字符/token)。设环境变量
+    UNITY_LLM_NO_LOG=1 关掉。
     """
     if os.environ.get("UNITY_LLM_NO_LOG"):
         return
@@ -195,8 +231,15 @@ def _log_call(project_root: str, name: str, args: Dict,
             os.replace(path, path + ".1")
         rec = {"t": int(time.time()), "tool": name,
                "args": {k: v for k, v in args.items() if k != "paths"},
-               "chars": out_chars, "approx_tokens": out_chars // 4,
+               "chars": len(output_text),
+               "approx_tokens": estimate_tokens(output_text),
                "seconds": round(seconds, 3)}
+        paths = args.get("paths") or []
+        if paths:
+            rec["n_paths"] = len(paths)
+            rec["paths_head"] = list(paths)[:3]
+        if resolved_kind:
+            rec["resolved_kind"] = resolved_kind
         if error:
             rec["error"] = error
         with open(path, "a", encoding="utf-8") as f:
@@ -205,16 +248,29 @@ def _log_call(project_root: str, name: str, args: Dict,
         pass  # 日志是附赠品,永远不能影响工具调用
 
 
-def make_dispatcher(project_root: str) -> Callable[[str, Dict], Any]:
+def make_dispatcher(project_root: str,
+                    allowed_tools=None) -> Callable[[str, Dict], Any]:
+    checked_schema = False
+
     def need_graph():
+        nonlocal checked_schema
         if not graph.has_graph(project_root):
-            return graph.build(project_root)
-        return None
+            raise RuntimeError(
+                "图谱不存在。全量建图可能耗时较长,MCP 不会隐式执行;请先运行 "
+                f"`python -m unity_llm build --project \"{project_root}\"`。")
+        if not checked_schema:
+            graph.ensure_schema(project_root)
+            checked_schema = True
 
     def dispatch(name: str, args: Dict) -> Any:
-        built = need_graph()  # 首次使用自动建图,省掉「先跑 build」这一步
+        if allowed_tools is not None and name not in allowed_tools:
+            raise ValueError(f"工具 `{name}` 不在当前 MCP profile 中")
+        if name == "unity_rebuild":
+            return {"ok": True, "stats": graph.build(project_root)}
+        need_graph()
         low = bool(args.get("include_low", False))
-        limit = int(args.get("limit", queries.DEFAULT_LIMIT))
+        limit = int(args.get("limit", _DEFAULT_LIMITS.get(
+            name, queries.DEFAULT_LIMIT)))
         if name == "unity_stats":
             out = queries.stats(project_root)
         elif name == "unity_impact":
@@ -228,7 +284,9 @@ def make_dispatcher(project_root: str) -> Callable[[str, Dict], Any]:
             out = queries.components(project_root, args["target"], limit=limit)
         elif name == "unity_find":
             out = queries.find_symbols(project_root, args["pattern"],
-                                       limit=int(args.get("limit", 30)))
+                                       limit=int(args.get(
+                                           "limit", _DEFAULT_LIMITS["unity_find"])),
+                                       kind=args.get("kind") or None)
         elif name == "unity_dead_code":
             out = queries.dead_code(
                 project_root,
@@ -240,14 +298,16 @@ def make_dispatcher(project_root: str) -> Callable[[str, Dict], Any]:
             out = context_mod.build_context(
                 project_root, args["target"],
                 budget_tokens=int(args.get("budget", 2000)))
-        elif name == "unity_rebuild":
-            out = {"ok": True, "stats": graph.build(project_root)}
         elif name == "unity_update":
-            out = graph.update_files(project_root, list(args["paths"]))
+            paths = args.get("paths")
+            if not paths:
+                raise ValueError(
+                    "unity_update 需要 paths(项目相对路径列表),"
+                    "如 [\"Assets/Scripts/Enemy.cs\"]。"
+                    "会话内也可不调,交给 git post-commit hook。")
+            out = graph.update_files(project_root, list(paths))
         else:
             raise ValueError(f"未知工具: {name}")
-        if built and isinstance(out, dict):
-            out["auto_built"] = built
         return out
     return dispatch
 
@@ -257,14 +317,16 @@ def _send(msg: Dict) -> None:
     sys.stdout.flush()
 
 
-def serve(project_root: str) -> None:
+def serve(project_root: str, profile: str = "core") -> None:
     # Windows 控制台默认 GBK;MCP 要求 UTF-8
     for stream in (sys.stdin, sys.stdout):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
-    dispatch = make_dispatcher(project_root)
+    selected_tools = tools_for_profile(profile)
+    allowed_tools = {t["name"] for t in selected_tools}
+    dispatch = make_dispatcher(project_root, allowed_tools=allowed_tools)
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -285,7 +347,8 @@ def serve(project_root: str) -> None:
         elif method == "ping":
             _send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "tools/list":
-            _send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+            _send({"jsonrpc": "2.0", "id": rid,
+                   "result": {"tools": selected_tools}})
         elif method == "tools/call":
             params = req.get("params", {})
             tool = params.get("name", "")
@@ -294,11 +357,15 @@ def serve(project_root: str) -> None:
             try:
                 result = dispatch(tool, call_args)
                 payload = _ok_text(result)
+                rk = ""
+                if isinstance(result, dict) and isinstance(result.get("resolved"), dict):
+                    rk = result["resolved"].get("kind") or ""
                 _log_call(project_root, tool, call_args,
-                          len(payload["content"][0]["text"]), time.time() - t0)
+                          payload["content"][0]["text"], time.time() - t0,
+                          resolved_kind=rk)
                 _send({"jsonrpc": "2.0", "id": rid, "result": payload})
             except Exception as e:  # 工具错误按 MCP 规范走 isError
-                _log_call(project_root, tool, call_args, 0,
+                _log_call(project_root, tool, call_args, "",
                           time.time() - t0, error=str(e))
                 _send({"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": f"错误: {e}"}],

@@ -30,7 +30,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from unity_llm import graph, queries, context as context_mod  # noqa: E402
-from unity_llm.mcp_server import TOOLS  # noqa: E402
+from unity_llm.mcp_server import TOOLS, make_dispatcher, tools_for_profile  # noqa: E402
+from unity_llm.tokens import estimate_tokens  # noqa: E402
 
 FIXTURE = os.path.join(ROOT, "tests", "fixtures", "SampleProject")
 
@@ -65,9 +66,9 @@ def ensure_png():
 def test_build():
     print("[1] build")
     stats = graph.build(FIXTURE)
-    check("脚本数", stats["scripts"] == 5, str(stats))
-    check("类型数", stats["types"] == 5, str(stats))
-    check("YAML 资产数", stats["yaml_assets"] == 3, str(stats))
+    check("脚本数", stats["scripts"] == 10, str(stats))
+    check("类型数", stats["types"] == 13, str(stats))
+    check("YAML 资产数", stats["yaml_assets"] == 4, str(stats))
     check("序列化引用数>=5", stats["refs"] >= 5, str(stats))
     check("资产数>=9", stats["assets"] >= 9, str(stats))
     check("UnityEvent 绑定==1", stats["events"] == 1, str(stats))
@@ -78,9 +79,9 @@ def test_build():
 def test_stats():
     print("[2] stats")
     s = queries.stats(FIXTURE)
-    check("mono_behaviours==2", s["mono_behaviours"] == 2, str(s))
+    check("mono_behaviours==6", s["mono_behaviours"] == 6, str(s))
     check("scriptable_objects==1", s["scriptable_objects"] == 1, str(s))
-    check("生命周期方法==3(Start/Update/Awake)", s["lifecycle_methods"] == 3, str(s))
+    check("生命周期方法==4(Start/Update/Awake+BusListener.Start)", s["lifecycle_methods"] == 4, str(s))
     check("unity_events==1", s["unity_events"] == 1, str(s))
     check("置信度分布存在", isinstance(s["call_confidence"], dict)
           and sum(s["call_confidence"].values()) == s["calls"],
@@ -175,6 +176,9 @@ def test_components():
     mounted = {m["asset"] for m in r2["mounted_on"]}
     check("Enemy 被 Enemy.prefab 挂载",
           any("Enemy.prefab" in m for m in mounted), str(mounted))
+    on_go = {m["on"] for m in r2["mounted_on"] if "Enemy.prefab" in m["asset"]}
+    check("挂载点是 GameObject 名而不是 MonoBehaviour",
+          "Enemy" in on_go, str(on_go))
 
 
 def test_deadcode():
@@ -191,6 +195,10 @@ def test_deadcode():
           not any("OnPlayerTouched" in m for m in methods), str(methods))
     check("OnButtonClicked 不误报(UnityEvent 绑定)",
           not any("OnButtonClicked" in m for m in methods), str(methods))
+    check("序列化字段恰好同名不能隐藏死方法",
+          any("UnusedPrivateMethod" in m for m in methods), str(methods))
+    check("field_call 末段方法计为已调用",
+          not any("EventChannel.AddListener" in m for m in methods), str(methods))
     check("Start/Update 不误报(生命周期)",
           not any(m.endswith(".Start()") or m.endswith(".Update()")
                   for m in methods), str(methods))
@@ -224,7 +232,11 @@ def test_context():
     check("包含生命周期标注", "lifecycle" in text)
     check("包含 prefab 依赖", "Enemy.prefab" in text)
     check("包含 UnityEvent 区块", "UnityEvent" in text)
-    check("预算内", len(text) <= 2000 * 4 * 2, str(len(text)))
+    check("严格 token 预算内", estimate_tokens(text) <= 2000,
+          str(estimate_tokens(text)))
+    tiny = context_mod.build_context(FIXTURE, "Enemy", budget_tokens=120)
+    check("小预算也严格封顶", estimate_tokens(tiny) <= 120,
+          str(estimate_tokens(tiny)))
 
 
 def test_mcp_smoke():
@@ -250,9 +262,11 @@ def test_mcp_smoke():
     proc.stdin.flush()
     tools = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = {t["name"] for t in tools["result"]["tools"]}
-    check(f"tools/list {len(TOOLS)} 个工具", len(names) == len(TOOLS), str(names))
-    check("含 unity_components / unity_validate",
-          {"unity_components", "unity_validate"} <= names, str(names))
+    core = {t["name"] for t in tools_for_profile("core")}
+    check("默认只暴露 core 工具", names == core and len(names) < len(TOOLS),
+          str(names))
+    check("core 含 Unity 独占查询",
+          {"unity_impact", "unity_refs", "unity_components"} <= names, str(names))
     call = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "unity_impact",
                            "arguments": {"target": "TakeDamage"}}})
@@ -262,8 +276,8 @@ def test_mcp_smoke():
               for c in payload["code_dependents"]), str(payload)[:300])
     call2 = rpc({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                  "params": {"name": "unity_stats", "arguments": {}}})
-    payload2 = json.loads(call2["result"]["content"][0]["text"])
-    check("tools/call unity_stats", payload2["scripts"] == 5, str(payload2))
+    check("core 拒绝 admin 工具", call2["result"].get("isError") is True,
+          str(call2))
     call3 = rpc({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
                  "params": {"name": "unity_components",
                             "arguments": {"target": "Enemy"}}})
@@ -282,7 +296,7 @@ def test_mcp_smoke():
     check("calls.log 记录了工具调用", len(lines) >= 4, str(len(lines)))
     check("calls.log 带返回体大小/估算 token",
           any(r["tool"] == "unity_impact" and r["chars"] > 0
-              and r["approx_tokens"] == r["chars"] // 4 for r in lines),
+              and r["approx_tokens"] > 0 for r in lines),
           str(lines[:2]))
 
 
@@ -313,6 +327,8 @@ def test_update():
                                      "Assets/Prefabs/Enemy.prefab"])
         check("两个文件更新成功且无错误",
               len(r["updated"]) == 2 and not r["errors"], str(r))
+        check("增量更新同步 schema 版本",
+              queries.stats(dst)["version"] == "0.6.0")
         d = queries.dead_code(dst)
         methods = {m["method"] for m in d["dead_methods"]}
         check("新方法名进入死代码", any("NewDeadMethod" in m for m in methods),
@@ -332,6 +348,25 @@ def test_update():
         d2 = queries.dead_code(dst)
         check("删除后 NeverCalled 从死代码里消失",
               not any("NeverCalled" in m["method"] for m in d2["dead_methods"]))
+        # 4) 删除一个仍被 prefab 引用的脚本:tombstone 保留可解释性
+        os.remove(enemy)
+        r3 = graph.update_files(dst, ["Assets/Scripts/Enemy.cs"])
+        refs = queries.find_refs(dst, ENEMY_CS_GUID)
+        check("删除资产仍可按旧 guid 解释入边",
+              refs["resolved"].get("deleted") is True
+              and any("Enemy.prefab" in x["src_path"]
+                      for x in refs["serialized_refs"]), str(refs))
+        check("删除资产仍计为悬空引用",
+              queries.validate(dst)["summary"]["distinct_dangling"] >= 1)
+        os.remove(enemy + ".meta")
+        graph.build(dst)
+        rebuilt_refs = queries.find_refs(dst, ENEMY_CS_GUID)
+        check("全量 build 后 tombstone 仍保留",
+              rebuilt_refs["resolved"].get("deleted") is True
+              and bool(rebuilt_refs["serialized_refs"]), str(rebuilt_refs))
+        escaped = graph.update_files(dst, ["../outside.cs"])
+        check("增量路径不能越出项目根目录",
+              bool(escaped["errors"]) and not escaped["updated"], str(escaped))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -391,7 +426,7 @@ def test_caller_scope():
           s["external_callers"] + s["internal_calls"] == s["code_dependents"],
           str(s))
     text = context_mod.build_context(FIXTURE, "Enemy")
-    check("上下文包分两段", "外部调用方" in text and "内部自调用" in text,
+    check("上下文包分两段", "外部调用方" in text and "内部调用" in text,
           text[-800:])
 
 
@@ -521,6 +556,135 @@ def test_parser_masking():
           "$\"{VerifyServer}\" 里的洞是真代码")
 
 
+def test_partial_and_relay():
+    print("[22] partial 合并 + Type.Field.Method 链式调用 + is_mono 基类链")
+    from unity_llm.graph import connect
+    from unity_llm.queries import resolve_target
+    conn = connect(FIXTURE)
+    n = resolve_target(conn, "BattleCore")
+    check("短名 BattleCore 不因 partial 变成 ambiguous",
+          n.get("kind") == "type", str(n))
+    check("partial 标记", n.get("partial") is True, str(n))
+    check("guid 并集包含主文件和 Net 文件",
+          len(n.get("guids") or []) >= 2, str(n.get("guids")))
+    shop = resolve_target(conn, "ShopPage")
+    check("ShopPage 沿 BasePage 链标成 MonoBehaviour",
+          shop.get("is_mono") == 1, str(shop))
+    conn.close()
+
+    imp = queries.impact(FIXTURE, "BattleCore.OnGiveup")
+    assets = {a["asset"] for a in imp["asset_dependents"]}
+    check("方法级 impact 能看到主文件挂的 prefab(不是 Net.cs 的 guid)",
+          any("BattleCore.prefab" in a for a in assets), str(assets))
+    mounted = queries.components(FIXTURE, "BattleCore")
+    on_go = {m["on"] for m in mounted.get("mounted_on") or []}
+    check("BattleCore 挂在 BattleCoreGO 上",
+          "BattleCoreGO" in on_go, str(mounted))
+
+    rly = queries.impact(FIXTURE, "EventHub")
+    vias = {c["via"] for c in rly["code_dependents"]}
+    check("EventHub 能看到 field_call 边", "field_call" in vias, str(rly["code_dependents"]))
+    field = queries.impact(FIXTURE, "EventHub.ScoreChanged")
+    check("Owner.Field 解析为 field",
+          field["resolved"].get("kind") == "field", str(field["resolved"]))
+    callers = {c["caller"] for c in field["code_dependents"]}
+    check("BusListener.Start 经静态字段调用了 ScoreChanged",
+          any("BusListener.Start" in c for c in callers), str(callers))
+    unused = queries.impact(FIXTURE, "EventHub.UnusedChannel")
+    check("没人用的静态字段没有外部调用方",
+          unused["summary"].get("code_dependents", 0) == 0, str(unused["summary"]))
+
+
+def test_correctness_hardening():
+    print("[23] namespace 消歧 + MCP 不隐式建图")
+    conn = graph.connect(FIXTURE)
+    cur = conn.cursor()
+    for full in ("N1.Widget", "N2.Widget", "N2.Caller", "N3.Caller"):
+        name, ns = full.rsplit(".", 1)[1], full.rsplit(".", 1)[0]
+        cur.execute(
+            "INSERT INTO types(name,full_name,kind,namespace,bases,modifiers,"
+            "attributes,file,guid,line) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (name, full, "class", ns, "", "", "", "synthetic.cs", "", 1))
+    for owner, name in (("N1.Widget", "Foo"), ("N2.Widget", "Foo"),
+                        ("N1.Widget", "Unique")):
+        cur.execute(
+            "INSERT INTO members(owner,kind,name,signature,modifiers,attributes,"
+            "extra,line,file,guid) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (owner, "method", name, name + "()", "", "", "void", 1,
+             "synthetic.cs", ""))
+    for src, name in (("N2.Caller", "Foo"), ("N3.Caller", "Unique")):
+        cur.execute(
+            "INSERT INTO calls(src_owner,src_member,kind,target,name,recv,"
+            "recv_type,arg,line,file) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (src, "Run", "dotcall", "Widget." + name, name, "Widget",
+             "Widget", "", 1, "synthetic.cs"))
+    graph._resolve_calls(cur)
+    local = cur.execute(
+        "SELECT resolved_owner,confidence FROM calls"
+        " WHERE file='synthetic.cs' AND name='Foo'").fetchone()
+    ambiguous = cur.execute(
+        "SELECT resolved_owner,confidence FROM calls"
+        " WHERE file='synthetic.cs' AND name='Unique'").fetchone()
+    check("同 namespace 唯一候选可 high",
+          tuple(local) == ("N2.Widget", "high"), str(dict(local)))
+    check("无 namespace 证据的重名类型不误标 high",
+          ambiguous["confidence"] == "medium"
+          and ambiguous["resolved_owner"] == "N1.Widget", str(dict(ambiguous)))
+    conn.rollback()
+    conn.close()
+
+    import tempfile
+    import shutil
+    root = tempfile.mkdtemp(prefix="unity_llm_no_auto_")
+    try:
+        os.makedirs(os.path.join(root, "Assets"))
+        dispatch = make_dispatcher(root)
+        try:
+            dispatch("unity_impact", {"target": "X"})
+            raised = False
+        except RuntimeError:
+            raised = True
+        check("MCP 查询不隐式触发昂贵全量 build",
+              raised and not graph.has_graph(root))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_atomic_build():
+    print("[24] 原子 build + 延后索引")
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="unity_llm_atomic_")
+    try:
+        dst = os.path.join(tmp, "Proj")
+        shutil.copytree(FIXTURE, dst, ignore=shutil.ignore_patterns(".unity-llm"))
+        graph.build(dst)
+        before = queries.stats(dst)["scripts"]
+        old = graph._resolve_calls
+
+        def fail_after_parse(cur):
+            raise RuntimeError("synthetic build failure")
+
+        graph._resolve_calls = fail_after_parse
+        try:
+            graph.build(dst)
+            raised = False
+        except RuntimeError:
+            raised = True
+        finally:
+            graph._resolve_calls = old
+        check("失败 build 不覆盖旧 graph.db",
+              raised and queries.stats(dst)["scripts"] == before)
+        conn = graph.connect(dst)
+        idx = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        conn.close()
+        check("calls(kind,arg) 复合索引存在",
+              "idx_calls_kind_arg" in idx, str(idx))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -533,7 +697,8 @@ def main():
              test_context, test_mcp_smoke, test_update, test_resolve_fuzzy,
              test_caller_scope, test_deadcode_exclude, test_project_config,
              test_guid_warning_precision, test_method_ref,
-             test_parser_masking]
+             test_parser_masking, test_partial_and_relay,
+             test_correctness_hardening, test_atomic_build]
     failed = 0
     for t in tests:
         try:

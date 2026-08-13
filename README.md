@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-106%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-130%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / methods / calls / inheritance / engine lifecycle callbacks)
@@ -134,7 +134,8 @@ If your `.meta` GUIDs were rewritten by an asset-protection tool, see
 ### 调用日志 `.unity-llm/calls.log`
 
 MCP server 会把每次工具调用记一行 JSON:工具名、参数、返回体字符数、
-`approx_tokens`(字符数 / 4)、耗时。用来量化「查图谱 vs 让模型通读文件」到底省多少 token。
+`approx_tokens`、耗时。估算对 CJK 按约 1 字符/token、其它文本按约
+4 字符/token,避免中文输出被统一 `chars/4` 低估。
 超过 2 MB 自动轮转成 `calls.log.1`。设 `UNITY_LLM_NO_LOG=1` 关掉。
 
 ```bash
@@ -142,19 +143,18 @@ MCP server 会把每次工具调用记一行 JSON:工具名、参数、返回体
 python -c "import json,sys;print(sum(json.loads(l)['approx_tokens'] for l in open(sys.argv[1],encoding='utf-8') if l.strip()))" /path/to/Proj/.unity-llm/calls.log
 ```
 
-### 省了多少:`tools/token_report.py`
+### 避免全文读取的估算上限:`tools/token_report.py`
 
-结算「净节省」并追加进一个 Markdown 台账,顺便打印一行
-`Unity-LLM已经帮你节省了Token：N`:
+估算查询可能避免的全文读取量并追加进 Markdown 台账:
 
 ```bash
 python tools/token_report.py --project /path/to/Proj --ledger /path/to/token-savings.md
 ```
 
-口径刻意保守:`baseline` 是这些调用涉及的源文件**全文** token(不用图谱时模型得整篇
-读进上下文,按 graph.db 里的类名/方法名/资产路径解析,同一文件只算一次),
-`spent` 是实际返回体的 `approx_tokens`,`net = baseline - spent`。
-`unity_update` / `stats` 这类不替代读文件的调用只计 spent,所以净收益可能为负 —— 不虚增。
+`baseline` 是目标涉及源文件的全文估算 token,`spent` 是工具返回体估算 token,
+`net = baseline - spent`。这是“如果原本会整篇读取”的**上限估计**,不是 API
+账单实测:它不含 MCP schema/输入,也不知道模型原本是否只会读片段。脚本和台账
+必须保留“估算上限”措辞,不要把这个数字当精确节省。
 
 游标存 `.unity-llm/token_report.state`,每次只结算新增的调用;台账里放一行
 `<!-- token-ledger -->`,新记录插在它下面(文件不存在就不写,不乱建文件)。
@@ -189,6 +189,10 @@ Claude Code 放进 memory 或 `CLAUDE.md`,Cursor 放 `.cursor/rules/`。
 python -m unity_llm init-config --project /path/to/YourUnityProject
 ```
 
+默认生成 `--profile core`,只向日常会话暴露
+`impact / refs / components / find / context` 五个查询工具。需要体检和维护时用
+`--profile admin`;兼容旧行为则用 `--profile full`。CLI 子命令始终全部可用。
+
 会打印一段配置,合并到对应文件即可:
 
 | 客户端            | 配置文件                                           |
@@ -222,15 +226,16 @@ python -m unity_llm context --project /path/to/Proj --target Enemy --budget 1500
 | `unity_context`    | token 预算内的精简上下文包(签名 + 依赖),改代码前先调它                               |
 | `unity_find`       | 按名字模糊搜索类型 / 成员 / 资产(第三方目录排在后面)                                  |
 | `unity_stats`      | 图谱统计:规模、UnityEvent 数、调用边置信度分布、guid 来源                           |
-| `unity_rebuild`    | 全量重建图谱                                                          |
+| `unity_rebuild`    | 全量重建图谱(`admin/full` profile)                                     |
 | `unity_update`     | **增量更新**:改了几个文件后只重建它们(秒级),支持修改/新增/删除                            |
 
-首次调用任意工具时若图谱不存在会**自动建图**,不需要先手动 `build`。
+MCP 查询不会隐式触发全量建图。首次使用先显式运行 `build`;这样 1 分钟级扫描不会
+在一个看似只读的工具调用里超时。`rebuild` 只在 `admin/full` profile 暴露。
 
 ## 让模型真的用上它(重要)
 
 装好 MCP 只是让工具**可用**,不等于会被调用。新开一个对话时,进模型上下文的
-只有工具名 + 描述(约 900 token),图谱内容一条都不读。模型什么时候调,取决于
+只有当前 profile 的工具名 + 描述,图谱内容一条都不读。模型什么时候调,取决于
 你的问法能不能撞上工具描述 —— 问「改 X 会影响谁」大概率会调,问
 「这个按钮点了没反应」它可能先去 grep。
 
@@ -246,15 +251,14 @@ python -m unity_llm context --project /path/to/Proj --target Enemy --budget 1500
 ```markdown
 ## 改代码前
 动 C# / prefab / scene 前先查影响面,别靠 grep 猜:
-- 改方法/脚本:unity_impact target=类名 或 Owner.Method
-- 改 prefab/scene/SO:unity_refs target=资产路径
+- 改方法/脚本:unity_impact target=类名 或 Owner.Method(partial 短名即可)
+- 改 prefab/scene/SO:unity_refs / unity_components(grep 看不到)
+- 改静态字段/事件总线:unity_impact target=Type.Field
 - 只要签名 + 依赖:unity_context(比读整个文件省 token)
-grep 看不到的耦合(prefab 序列化引用、UnityEvent onClick、SendMessage 字符串调用)
-只有这套工具能看到。
 
 ## 改完代码后
-编辑过任何 .cs / .prefab / .unity / .asset,收尾调一次
-unity_update paths=[改过的文件相对路径...] 刷新图谱(秒级)。
+不要在会话里例行调 unity_update。交给 git post-commit hook。
+只有接下来还要查刚改过的文件时才调一次。
 ```
 
 命中率高但不是 100%:规则是提示,不是强制。
@@ -337,6 +341,7 @@ exit 0
 | `api_generic` | `GetComponent<T>()` / `AddComponent<T>()` 等泛型 API        |
 | `api_string`  | `SendMessage("OnHit")` / `Invoke("X")` / `StartCoroutine("X")` |
 | `method_ref`  | **方法组引用**:`Register(OnFoo)`、`btn.onClick += OnFoo`(没括号的回调注册) |
+| `field_call`  | **链式静态字段**:`Type.Field.Method()`(事件总线、单例 `Xxx.Instance.Foo()` 等) |
 
 `method_ref` 是 0.4.0 加的:回调注册在 Unity 项目里满地都是,不认它会把
 成百上千个真正被调的回调方法误判成死代码。
@@ -361,15 +366,15 @@ python -m unity_llm impact      --project P --target T [--depth 3] [--include-lo
                                                   [--include-external] [--limit 60]
 python -m unity_llm refs        --project P --target T [--include-low] [--limit 60]
 python -m unity_llm components  --project P --target T [--limit 60]
-python -m unity_llm find        --project P --pattern 关键词 [--limit 30]
+python -m unity_llm find        --project P --pattern 关键词 [--kind type|member|asset] [--limit 12]
 python -m unity_llm deadcode    --project P [--include-external] [--limit 60]
                                  [--exclude 片段 ...]   # 临时排除噪声目录
 python -m unity_llm validate    --project P [--limit 60]
 python -m unity_llm update      --project P --files Assets/Scripts/Enemy.cs [...]
                                  # 增量更新指定文件(秒级);文件已删除则清除其数据
 python -m unity_llm context     --project P --target T [--budget 2000] [--out ctx.md]
-python -m unity_llm serve       --project P                        MCP stdio server
-python -m unity_llm init-config --project P                        生成 MCP 客户端配置
+python -m unity_llm serve       --project P [--profile core|full|admin]
+python -m unity_llm init-config --project P [--profile core|full|admin]
 ```
 
 所有命令输出 JSON(context 输出 Markdown),可直接被脚本和其它 LLM 管道消费。
@@ -396,7 +401,8 @@ python tests/run_tests.py
 **同名方法跨类型误报的精度回归**、引用查找(含「方法级 refs 只返回该方法」)、组件清单、
 死代码误报控制、**方法组引用(`method_ref`)**、**解析器注释/字符串遮蔽回归**、
 悬空引用体检、上下文打包、MCP 握手与 `tools/call`、**增量更新(改/增/删)**
-共 **106 项断言 / 21 个测试组**。
+并覆盖 partial、namespace 重名、原子 build、tombstone、MCP profile 和严格
+token 预算。共 **130 项断言 / 24 个测试组**。
 
 ## 能力与局限(诚实声明)
 
@@ -415,6 +421,49 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
 
 ## Changelog
+
+### 0.6.0
+
+本轮先修结论可信度,再减会话 token 和构建风险:
+
+- **调用消歧不再“重名取第一个”**:同 namespace 的唯一候选才可升 `high`;
+  缺 namespace/using 证据时最多 `medium`。
+- **dead-code 修正**:`Type.Field.Method()` 的末段 `Method` 会计为已调用;
+  YAML 序列化字段恰好与方法同名不再全局隐藏死方法。
+- **删除资产 tombstone**:增量删除后仍可按旧 path/guid 解释入边,
+  `validate` 同时继续报告悬空引用。
+- **MCP profile**:默认 `core` 只暴露 5 个日常查询工具;`admin/full` 按需启用。
+  MCP 不再隐式执行昂贵全量建图。
+- **输出瘦身**:`impact` 去掉重复传递路径和恒定说明,`resolved` 只返回公开身份;
+  MCP 默认 limit 降为 impact 8 / refs 12 / components 20 / find 5。
+- **context 硬预算**:CJK-aware 估算,任何预算都严格封顶;UnityEvent/序列化依赖
+  和外部调用方优先于低价值私有成员列表。
+- **构建可靠性/性能**:全量 build 写临时 SQLite 后原子替换旧库,
+  批量插入完成后才建索引;新增 `calls(kind,arg)` 复合索引。
+- **安全边界**:`update` 拒绝越出 Unity 项目根目录的相对路径。
+- 测试扩到 **130 项断言 / 24 组**。
+
+### 0.5.0
+
+查询层不强制重建;要看到 **relay 边 / GameObject 名 / is_mono 基类链**,
+对现有项目跑一次 `build`。schema 无变更,`update` 仍可用。
+
+对着约 3.75 万资产的真实项目修的实战洞:
+
+- **partial 类短名可查**:同名拆到多个 `.cs` 文件时不再判 ambiguous。
+  guid 取所有 partial 文件的并集,方法级 impact 能看到挂在主文件上的 prefab。
+- **`kind=field_call`**:`Type.Field.Method()` 链式调用以前被拆成 `Field.Method`
+  并标 low 丢掉。现在任意静态字段/单例链都能回溯到类型和字段
+  (不写死某个项目的事件 API)。
+- **GameObject 名**:沿 `m_GameObject` fileID 还原物体名,
+  `unity_components` 不再满屏 `on: MonoBehaviour`。
+- **`is_mono` 沿基类链传播**:自定义 UI 基类的子页面也会标成 MonoBehaviour。
+- **`unity_find` 默认每类 12 条精简索引**(名+路径),可按 `kind` 过滤。
+- **impact 默认丢掉 `dead_code_exclude` 目录**的资产传递引用。
+- **Cursor 接入**:`init-config` 写明必须用 `<项目>/.cursor/mcp.json`,
+  并带上 `PYTHONPATH`(源码树直接跑)。`unity_update` 缺 `paths` 时给人话错误。
+- **calls.log** 记录 `n_paths` / `paths_head` / `resolved_kind`。
+- 测试 106 → **117 项断言 / 22 组**。
 
 ### 0.4.0
 
@@ -453,8 +502,11 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 - [x] 增量更新(`update` / `unity_update`:只重建变更文件)
 - [x] git hook 自动触发增量更新(`tools/post-commit.sample`)+ Claude Code
       PostToolUse hook(`tools/hook_post_edit.py`)
+- [x] 链式静态字段调用(`Type.Field.Method()`,含事件总线 / 单例)
 - [ ] 文件监听 daemon(免 hook,编辑器里手改也实时跟)
 - [x] UnityEvent / Inspector 事件绑定的 YAML 提取
+- [ ] Unity 本地 fileID 对象图 + prefab override `propertyPath` 语义
+- [ ] AnimationEvent / Timeline Signal 静态入口
 - [ ] `transform.Find` 路径 ↔ 场景层级校验
 - [ ] Addressables / AssetBundle 分组分析
 - [ ] 导出 DOT / Mermaid 架构图
@@ -462,7 +514,11 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 106 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 130 项断言全绿。
+
+历次模型评审记录见 [REVIEWS.md](REVIEWS.md)(Kimi k3 / Claude Opus 5 /
+Cursor Grok 4.6 / GPT-5.6 Sol)。下一轮请对着真实项目和 `calls.log` 审,
+不要只打 fixture。
 
 ## License
 

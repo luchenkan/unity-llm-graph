@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""统计 unity-llm 这一段时间省了多少 token,并把结果追加进一个 Markdown 台账。
+"""估算 unity-llm 避免通读文件的 token 上限,并追加 Markdown 台账。
 
 用法(通常由 Claude Code 的 Stop hook 调用,也能手跑):
 
@@ -8,10 +8,13 @@
 
 口径(刻意保守,宁可少报):
 
-    spent    = 本段内所有 MCP 工具调用返回体的 approx_tokens(实际花掉的)
-    baseline = 这些调用涉及到的源文件全文 token 数(不用图谱时模型得整篇读进去),
+    spent    = 本段内所有 MCP 工具调用返回体的估算 token
+    baseline = 这些调用涉及到的源文件全文估算 token(假设否则会整篇读入),
                同一文件只算一次;`.unity-llm/graph.db` 里按类名/方法名/资产路径解析
-    net      = baseline - spent
+    net      = baseline - spent,是“避免全文读取”的上限估计,不是 API 账单实测。
+
+中日韩字符按 1 token、其余按约 4 字符/token。未计 MCP schema、工具输入及
+模型可能本来只读文件片段的情况,所以输出必须标“估算上限”,不能宣称精确节省。
 
 无法解析目标的调用(stats / deadcode / update ...)只计 spent,不计 baseline ——
 它们不替代读文件,所以只会拉低净收益,不会虚增。
@@ -28,7 +31,10 @@ import sqlite3
 import sys
 import time
 
-CHARS_PER_TOKEN = 4
+FRAMEWORK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, FRAMEWORK_ROOT)
+from unity_llm.tokens import estimate_tokens  # noqa: E402
+
 DB_DIR = ".unity-llm"
 STATE = "token_report.state"
 CALL_LOG = "calls.log"
@@ -128,7 +134,8 @@ def main() -> int:
     for rel in sorted(files):
         p = os.path.join(root, rel.replace("/", os.sep))
         try:
-            baseline += os.path.getsize(p) // CHARS_PER_TOKEN
+            with open(p, encoding="utf-8", errors="replace") as f:
+                baseline += estimate_tokens(f.read())
             counted.append(rel)
         except Exception:
             pass
@@ -151,7 +158,7 @@ def main() -> int:
         _append_ledger(a.ledger, recs, counted, baseline, spent, net,
                        st.get("total_net", net))
 
-    print("Unity-LLM已经帮你节省了Token：%d" % net)
+    print("Unity-LLM 避免全文读取的估算净 token 上限：%d" % net)
     return 0
 
 

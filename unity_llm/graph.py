@@ -16,7 +16,8 @@
   接收者类型未知则退化为按名字匹配 —— 名字全项目唯一才给 medium,
   否则 low(Refresh/Init/Show 这类热名字会拉出成百上千噪声,必须降级)。
 
-图存在 <项目>/.unity-llm/graph.db,构建是幂等的(全量重建)。
+图存在 <项目>/.unity-llm/graph.db。全量构建先写临时库,成功后原子替换,
+失败时不会破坏上一份可用图。
 """
 from __future__ import annotations
 
@@ -44,6 +45,12 @@ CREATE TABLE IF NOT EXISTS assets (
     path TEXT NOT NULL,
     ext TEXT NOT NULL,
     external INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS deleted_assets (
+    guid TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    ext TEXT NOT NULL,
+    deleted_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS types (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +90,7 @@ CREATE TABLE IF NOT EXISTS calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     src_owner TEXT NOT NULL,    -- 调用发起方类型 full_name
     src_member TEXT NOT NULL,   -- 调用发起方方法名
-    kind TEXT NOT NULL,         -- call / dotcall / new / api_generic / api_string / method_ref
+    kind TEXT NOT NULL,         -- call / dotcall / new / api_generic / api_string / method_ref / field_call
     target TEXT NOT NULL,       -- 原文目标,如 "enemy.TakeDamage"
     name TEXT NOT NULL DEFAULT '',       -- 方法名 / 类型名
     recv TEXT NOT NULL DEFAULT '',       -- 接收者表达式原文
@@ -116,16 +123,21 @@ CREATE TABLE IF NOT EXISTS dotted_members (
     name TEXT NOT NULL,         -- 被 `x.Name` 形式访问过的成员名(非调用)
     file TEXT NOT NULL
 );
+"""
+
+INDEX_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_dotted_name ON dotted_members(name);
 CREATE INDEX IF NOT EXISTS idx_refs_dst ON refs(dst_guid);
 CREATE INDEX IF NOT EXISTS idx_refs_src ON refs(src_guid);
 CREATE INDEX IF NOT EXISTS idx_calls_target ON calls(target);
 CREATE INDEX IF NOT EXISTS idx_calls_name ON calls(name);
 CREATE INDEX IF NOT EXISTS idx_calls_resolved ON calls(resolved_owner);
+CREATE INDEX IF NOT EXISTS idx_calls_kind_arg ON calls(kind, arg);
 CREATE INDEX IF NOT EXISTS idx_members_name ON members(name);
 CREATE INDEX IF NOT EXISTS idx_members_owner ON members(owner);
 CREATE INDEX IF NOT EXISTS idx_types_name ON types(name);
 CREATE INDEX IF NOT EXISTS idx_events_method ON events(method);
+CREATE INDEX IF NOT EXISTS idx_deleted_path ON deleted_assets(path);
 """
 
 # 同名方法在超过这么多类型里出现,就算「热名字」:接收者类型未知时
@@ -137,10 +149,27 @@ def db_path(project_root: str) -> str:
     return os.path.join(project_root, DB_DIR, DB_NAME)
 
 
-def connect(project_root: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path(project_root))
+def _connect_path(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def connect(project_root: str) -> sqlite3.Connection:
+    return _connect_path(db_path(project_root))
+
+
+def ensure_schema(project_root: str) -> None:
+    """给旧 graph.db 补兼容表/索引,不要求为小型 schema 追加做全量重建。"""
+    if not has_graph(project_root):
+        return
+    conn = connect(project_root)
+    try:
+        conn.executescript(SCHEMA)
+        conn.executescript(INDEX_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _asset_ext(path: str) -> str:
@@ -154,7 +183,9 @@ def _resolve_calls(cur) -> Dict[str, int]:
     type_by_short: Dict[str, List[str]] = {}
     bases_of: Dict[str, List[str]] = {}
     for r in cur.execute("SELECT name, full_name, bases FROM types"):
-        type_by_short.setdefault(r["name"], []).append(r["full_name"])
+        bucket = type_by_short.setdefault(r["name"], [])
+        if r["full_name"] not in bucket:
+            bucket.append(r["full_name"])
         bases_of[r["full_name"]] = [b for b in r["bases"].split(",") if b]
 
     declares: Set[Tuple[str, str]] = set()      # (type full_name, member name)
@@ -163,46 +194,70 @@ def _resolve_calls(cur) -> Dict[str, int]:
         declares.add((r["owner"], r["name"]))
         owners_of.setdefault(r["name"], set()).add(r["owner"])
 
+    def namespace_of(full: str) -> str:
+        return full.rpartition(".")[0]
+
+    def preferred(cands: List[str], src_owner: str) -> Optional[str]:
+        """短名重名时只接受唯一候选或调用方同 namespace 的唯一候选。"""
+        if len(cands) == 1:
+            return cands[0]
+        src_ns = namespace_of(src_owner)
+        local = [c for c in cands if namespace_of(c) == src_ns]
+        return local[0] if len(local) == 1 else None
+
     def chain(full: str, depth: int = 6) -> List[str]:
-        """自身 + 基类链(短名转 full_name,遇歧义取第一个)。"""
-        out = [full]
-        cur_full = full
-        while depth > 0:
-            depth -= 1
-            nxt = None
+        """自身 + 可无歧义解析的基类/接口图;绝不随意取重名候选。"""
+        out = []
+        queue = [(full, 0)]
+        while queue:
+            cur_full, level = queue.pop(0)
+            if cur_full in out:
+                continue
+            out.append(cur_full)
+            if level >= depth:
+                continue
             for b in bases_of.get(cur_full, []):
-                cands = type_by_short.get(b)
-                if cands:
-                    nxt = cands[0]
-                    break
-            if not nxt or nxt in out:
-                break
-            out.append(nxt)
-            cur_full = nxt
+                cands = type_by_short.get(b, [])
+                nxt = preferred(cands, cur_full)
+                if nxt and nxt not in out:
+                    queue.append((nxt, level + 1))
         return out
 
-    def resolve(kind: str, name: str, recv_type: str) -> Tuple[str, str]:
+    def resolve(kind: str, name: str, recv_type: str,
+                src_owner: str) -> Tuple[str, str]:
         # 类型级边:new X() / GetComponent<X>() —— 目标就是类型本身
         if kind in ("new", "api_generic"):
             cands = type_by_short.get(short_type(name) or name, [])
-            if len(cands) == 1:
-                return cands[0], "high"
+            picked = preferred(cands, src_owner)
+            if picked:
+                return picked, "high"
             return "", "medium" if cands else "low"
         if kind == "api_string":
             # 字符串调用(SendMessage 等):目标类型天然不可知,但这是真耦合
             return "", "medium"
+        if kind in ("field_call", "relay"):
+            # Type.Field.Method():recv_type 是类型,name 是字段
+            # relay 是 0.5.0 旧名,读老 graph.db 时仍能解析
+            cands = type_by_short.get(recv_type, [])
+            picked = preferred(cands, src_owner)
+            if picked:
+                return picked, "high"
+            return "", "medium" if cands else "low"
         if recv_type:
             cands = type_by_short.get(recv_type, [])
-            if len(cands) == 1:
-                for t in chain(cands[0]):
+            picked = preferred(cands, src_owner)
+            if picked:
+                for t in chain(picked):
                     if (t, name) in declares:
                         return t, "high"
                 # 类型确定但方法不在链上:基类可能在 Unity/第三方,仍算相关
-                return cands[0], "medium"
-            hits = [c for c in cands
-                    for t in chain(c) if (t, name) in declares]
-            if len(set(hits)) == 1:
-                return hits[0], "high"
+                return picked, "medium"
+            hits = {t for c in cands for t in chain(c)
+                    if (t, name) in declares}
+            if len(hits) == 1:
+                # 没有 using 信息时,重名接收者即使只有一个候选声明该方法,
+                # 也不能升级成 high。
+                return next(iter(hits)), "medium"
             if hits:
                 return "", "low"
         # 接收者类型未知:退化为按名字匹配,名字唯一才可信
@@ -215,8 +270,10 @@ def _resolve_calls(cur) -> Dict[str, int]:
 
     updates = []
     counts = {"high": 0, "medium": 0, "low": 0}
-    for r in cur.execute("SELECT id, kind, name, recv_type FROM calls"):
-        owner, conf = resolve(r["kind"], r["name"], r["recv_type"])
+    for r in cur.execute(
+            "SELECT id, src_owner, kind, name, recv_type FROM calls"):
+        owner, conf = resolve(r["kind"], r["name"], r["recv_type"],
+                              r["src_owner"])
         counts[conf] += 1
         updates.append((owner, conf, r["id"]))
     cur.executemany("UPDATE calls SET resolved_owner=?, confidence=? WHERE id=?",
@@ -283,7 +340,8 @@ def _insert_yaml(cur, text: str, rel: str, guid: str) -> dict:
     yf = parse_unity_yaml(text)
     n = {"refs": 0, "events": 0}
     for doc in yf.docs:
-        ctx = doc.name or doc.class_name
+        go_name = yf.game_object_name(doc.go_fileid) if doc.go_fileid else ""
+        ctx = go_name or doc.name or doc.class_name
         if doc.refs:
             cur.executemany(
                 "INSERT INTO refs(src_guid, src_path, field, dst_guid,"
@@ -301,6 +359,31 @@ def _insert_yaml(cur, text: str, rel: str, guid: str) -> dict:
     return n
 
 
+def _propagate_mono(cur) -> int:
+    """沿基类链把 is_mono 传给 ShopPage : BasePage : GameBehaviour : MonoBehaviour。
+
+    解析期只看直接基类名,自定义 UI 基类(BasePage)的子类会漏标。
+    只做 0→1,迭代到不动为止。
+    """
+    marked = 0
+    changed = True
+    while changed:
+        changed = False
+        rows = list(cur.execute("SELECT id, bases, is_mono FROM types"))
+        mono_short = {r[0] for r in cur.execute(
+            "SELECT name FROM types WHERE is_mono=1")}
+        mono_short.update(("MonoBehaviour", "NetworkBehaviour"))
+        for r in rows:
+            if r["is_mono"]:
+                continue
+            bases = [b for b in (r["bases"] or "").split(",") if b]
+            if any(b in mono_short or b.endswith("Behaviour") for b in bases):
+                cur.execute("UPDATE types SET is_mono=1 WHERE id=?", (r["id"],))
+                changed = True
+                marked += 1
+    return marked
+
+
 def build(project_root: str, verbose: bool = False,
           include_external_code: bool = True) -> dict:
     """全量构建图谱。返回统计信息 dict。"""
@@ -310,10 +393,28 @@ def build(project_root: str, verbose: bool = False,
 
     guid_map, guid_source = build_guid_map(root)
 
-    if os.path.exists(db_path(root)):
-        os.remove(db_path(root))
-    conn = connect(root)
+    final_path = db_path(root)
+    building_path = final_path + ".building"
+    old_tombstones = []
+    if os.path.exists(final_path):
+        try:
+            old = _connect_path(final_path)
+            if old.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table'"
+                    " AND name='deleted_assets'").fetchone():
+                old_tombstones = list(old.execute(
+                    "SELECT guid,path,ext,deleted_at FROM deleted_assets"))
+            old.close()
+        except sqlite3.Error:
+            old_tombstones = []
+    if os.path.exists(building_path):
+        os.remove(building_path)
+    conn = _connect_path(building_path)
     cur = conn.cursor()
+    # 只作用于随时可丢弃的临时库;最终库仍由原子替换保证完整性。
+    cur.execute("PRAGMA journal_mode=OFF")
+    cur.execute("PRAGMA synchronous=OFF")
+    cur.execute("PRAGMA temp_store=MEMORY")
     cur.executescript(SCHEMA)
 
     stats = {"assets": 0, "scripts": 0, "types": 0, "members": 0,
@@ -328,6 +429,12 @@ def build(project_root: str, verbose: bool = False,
             " VALUES (?,?,?,?)",
             (guid, rel, _asset_ext(rel), int(is_external(rel, root))))
     stats["assets"] = len(guid_map)
+    for r in old_tombstones:
+        if r["guid"] not in guid_map:
+            cur.execute(
+                "INSERT OR REPLACE INTO deleted_assets"
+                "(guid,path,ext,deleted_at) VALUES (?,?,?,?)",
+                (r["guid"], r["path"], r["ext"], r["deleted_at"]))
 
     # 2) C# 代码图
     for abspath, rel in iter_assets(root):
@@ -365,15 +472,21 @@ def build(project_root: str, verbose: bool = False,
         stats["refs"] += n["refs"]
         stats["events"] += n["events"]
 
-    # 4) 调用边解析(接收者类型 -> 基类链 -> 真正的被调类型)
+    # 4) 自定义 MB 基类链(BasePage : GameBehaviour : MonoBehaviour)
+    _propagate_mono(cur)
+
+    # 5) 调用边解析(接收者类型 -> 基类链 -> 真正的被调类型)
     stats["confidence"] = _resolve_calls(cur)
 
     for k, v in (("built_at", str(int(time.time()))), ("version", __version__),
                  ("guid_source", guid_source)):
         cur.execute("INSERT OR REPLACE INTO meta_kv(key, value) VALUES (?,?)",
                     (k, v))
+    # 批量插入后再建索引,避免每行维护 B-tree。
+    cur.executescript(INDEX_SCHEMA)
     conn.commit()
     conn.close()
+    os.replace(building_path, final_path)
     stats["guid_source"] = guid_source
     stats["seconds"] = round(time.time() - t0, 2)
     return stats
@@ -391,6 +504,8 @@ def update_files(project_root: str, rel_paths) -> dict:
     t0 = time.time()
     conn = connect(root)
     cur = conn.cursor()
+    cur.executescript(SCHEMA)
+    cur.executescript(INDEX_SCHEMA)
     # 老版本建的库缺 code_used 等列,增量插入会直接报 SQL 错;提前给人话
     cols = {r[1] for r in cur.execute("PRAGMA table_info(members)")}
     if "code_used" not in cols:
@@ -403,7 +518,15 @@ def update_files(project_root: str, rel_paths) -> dict:
     for rel in rel_paths:
         rel = rel.replace("\\", "/").lstrip("/")
         abspath = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            if os.path.commonpath((root, os.path.abspath(abspath))) != root:
+                raise ValueError("路径越出项目根目录")
+        except (ValueError, OSError) as e:
+            out["errors"].append({"file": rel, "error": str(e)})
+            continue
         ext = _asset_ext(rel)
+        old_asset = cur.execute(
+            "SELECT guid, path, ext FROM assets WHERE path=?", (rel,)).fetchone()
         # 先清掉这个文件的旧数据
         for table, col in (("types", "file"), ("members", "file"),
                            ("calls", "file"), ("refs", "src_path"),
@@ -411,10 +534,19 @@ def update_files(project_root: str, rel_paths) -> dict:
             cur.execute(f"DELETE FROM {table} WHERE {col}=?", (rel,))
         cur.execute("DELETE FROM assets WHERE path=?", (rel,))
         if not os.path.exists(abspath):
+            if old_asset:
+                # 保留最小 tombstone:查询旧路径/guid 仍能解释悬空入边,
+                # 而 validate 仍会把它视为缺失资产。
+                cur.execute(
+                    "INSERT OR REPLACE INTO deleted_assets"
+                    "(guid,path,ext,deleted_at) VALUES (?,?,?,?)",
+                    (old_asset["guid"], old_asset["path"], old_asset["ext"],
+                     int(time.time())))
             out["deleted"].append(rel)
             continue
         guid = _guid_for_path(root, rel)
         if guid:
+            cur.execute("DELETE FROM deleted_assets WHERE guid=?", (guid,))
             cur.execute(
                 "INSERT OR REPLACE INTO assets(guid, path, ext, external)"
                 " VALUES (?,?,?,?)", (guid, rel, ext, int(is_external(rel, root))))
@@ -429,7 +561,13 @@ def update_files(project_root: str, rel_paths) -> dict:
         except Exception as e:
             out["errors"].append({"file": rel, "error": str(e)})
 
+    _propagate_mono(cur)
     out["confidence"] = _resolve_calls(cur)
+    cur.execute("INSERT OR REPLACE INTO meta_kv(key,value) VALUES ('version',?)",
+                (__version__,))
+    cur.execute(
+        "INSERT OR REPLACE INTO meta_kv(key,value) VALUES ('updated_at',?)",
+        (str(int(time.time())),))
     conn.commit()
     conn.close()
     out["seconds"] = round(time.time() - t0, 2)

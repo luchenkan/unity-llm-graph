@@ -31,6 +31,8 @@ REF_RE = re.compile(
 )
 
 NAME_RE = re.compile(r"^\s*m_Name:[ \t]*(.*)$", re.MULTILINE)
+GAMEOBJECT_RE = re.compile(
+    r"^\s*m_GameObject:\s*\{fileID:\s*(-?\d+)", re.MULTILINE)
 SCRIPT_RE = re.compile(
     r"^\s*m_Script:\s*\{fileID:\s*-?\d+,\s*guid:\s*(" + _GUID_BODY + r")",
     re.MULTILINE
@@ -87,6 +89,7 @@ class YamlDoc:
     stripped: bool
     name: str = ""
     script_guid: Optional[str] = None      # 仅 MonoBehaviour: 挂载的脚本 guid
+    go_fileid: Optional[int] = None        # m_GameObject fileID,用来还原物体名
     refs: List[YamlRef] = field(default_factory=list)
     events: List[YamlEvent] = field(default_factory=list)
 
@@ -189,7 +192,12 @@ def parse_unity_yaml(text: str) -> UnityYamlFile:
         )
         nm = NAME_RE.search(body)
         if nm:
-            doc.name = nm.group(1).strip()
+            doc.name = nm.group(1).strip().strip('"')
+        gm = GAMEOBJECT_RE.search(body)
+        if gm:
+            fid = int(gm.group(1))
+            if fid:
+                doc.go_fileid = fid
         sm = SCRIPT_RE.search(body)
         if sm:
             doc.script_guid = sm.group(1)

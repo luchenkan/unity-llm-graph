@@ -37,6 +37,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   healthBar: {fileID: 0, guid: e1000000000000000000000000000030, type: 3}
+  UnusedPrivateMethod: {fileID: 0, guid: e1000000000000000000000000000030, type: 3}
   hp: 100
 --- !u!114 &11400001
 MonoBehaviour:

@@ -64,7 +64,7 @@ def cmd_components(args) -> int:
 
 def cmd_find(args) -> int:
     _print(args, queries.find_symbols(_project(args), args.pattern,
-                                      limit=args.limit))
+                                      limit=args.limit, kind=args.kind))
     return 0
 
 
@@ -100,7 +100,7 @@ def cmd_context(args) -> int:
 
 def cmd_serve(args) -> int:
     from .mcp_server import serve
-    serve(_project(args))
+    serve(_project(args), profile=args.profile)
     return 0
 
 
@@ -108,20 +108,23 @@ def cmd_init_config(args) -> int:
     import os
     project = os.path.abspath(args.project)
     py = sys.executable.replace("\\", "/")
-    config = {
-        "mcpServers": {
-            "unity-llm": {
-                "command": py,
-                "args": ["-m", "unity_llm", "serve", "--project", project],
-            }
-        }
+    framework = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    framework = framework.replace("\\", "/")
+    server = {
+        "command": py,
+        "args": ["-m", "unity_llm", "serve", "--project",
+                 project.replace("\\", "/"), "--profile", args.profile],
+        "env": {"PYTHONPATH": framework},
     }
-    print("# 把下面 JSON 合并进你的 MCP 客户端配置:\n")
-    print("# Claude Code:        <项目>/.mcp.json")
-    print("# Cursor:             ~/.cursor/mcp.json 或 <项目>/.cursor/mcp.json")
-    print("# Claude Desktop:     claude_desktop_config.json 的 mcpServers 字段")
-    print("# Trae / Cherry Studio / CodeBuddy 等: 设置里的「MCP 服务器」添加 stdio 类型\n")
+    config = {"mcpServers": {"unity-llm": server}}
+    print("# 把下面 JSON 合并进你的 MCP 客户端配置。\n")
+    print("# Claude Code:  <项目>/.mcp.json")
+    print("# Cursor:       <项目>/.cursor/mcp.json")
+    print("#               (Cursor 通常不读项目根 .mcp.json,两条都写最稳)")
+    print("# Claude Desktop: claude_desktop_config.json 的 mcpServers 字段")
+    print("# Trae / Cherry Studio / CodeBuddy 等: 设置里添加 stdio 类型\n")
     print(json.dumps(config, ensure_ascii=False, indent=2))
+    print("\n# Cursor 专用:把上面整段写入 <项目>/.cursor/mcp.json 后重启 Cursor")
     from .meta import CONFIG_FILE, SUGGESTED_EXCLUDES
     print(f"\n# 可选:项目根 {CONFIG_FILE}(过滤死代码噪声目录 / 追加第三方目录判定)")
     print(json.dumps({"dead_code_exclude": list(SUGGESTED_EXCLUDES[:3]),
@@ -194,7 +197,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("find", help="按名字模糊搜索类型/成员/资产")
     add_project(sp)
     sp.add_argument("--pattern", required=True)
-    add_limit(sp, default=30)
+    sp.add_argument("--kind", default=None, choices=["type", "member", "asset"],
+                    help="只搜这一类,默认三类都搜")
+    add_limit(sp, default=12)
     sp.set_defaults(func=cmd_find)
 
     sp = sub.add_parser("deadcode", help="Unity 感知的死代码检测")
@@ -227,10 +232,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("serve", help="以 MCP stdio server 方式运行")
     add_project(sp)
+    sp.add_argument("--profile", choices=["core", "full", "admin"],
+                    default="core",
+                    help="暴露工具集:core=日常查询(默认),full=全部,admin=维护")
     sp.set_defaults(func=cmd_serve)
 
     sp = sub.add_parser("init-config", help="打印各 LLM 客户端的 MCP 配置示例")
     add_project(sp)
+    sp.add_argument("--profile", choices=["core", "full", "admin"],
+                    default="core")
     sp.set_defaults(func=cmd_init_config)
     return p
 

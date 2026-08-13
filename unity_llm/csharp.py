@@ -103,6 +103,11 @@ FIELD_RE = re.compile(
 )
 CALL_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
 DOTCALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
+# Type.Field.Method() —— 静态字段/单例上的链式调用。
+# 两段 DOTCALL 只会看成 Field.Method,recv_type 被大写启发式误判成字段名,
+# 事件总线、Xxx.Instance.Foo() 都会因此掉进 low。
+CHAIN_CALL_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
 GENERIC_APIS = (
     "GetComponent", "GetComponentInChildren", "GetComponentInParent",
     "GetComponents", "GetComponentsInChildren", "GetComponentsInParent",
@@ -246,11 +251,11 @@ def _parse_params(params: str) -> Dict[str, str]:
 
 @dataclass
 class CsCall:
-    kind: str          # call / dotcall / new / api_generic / api_string
-    name: str          # 被调方法名 / 类型名(new / api_generic 的泛型参数)
-    recv: str          # 接收者表达式原文("" = 裸调用)
+    kind: str          # call / dotcall / new / api_generic / api_string / field_call
+    name: str          # 被调方法名 / 类型名;field_call 时是中间字段名
+    recv: str          # 接收者表达式原文("" = 裸调用);field_call 时是类型名
     recv_type: str     # 推断出的接收者类型短名("" = 未知)
-    arg: str           # api_string 的字符串参数 / 其它情况同 name
+    arg: str           # api_string 的字符串参数;field_call 时是末段方法名
     line: int          # 调用所在行(evidence,LLM 可直接跳转)
 
     @property
@@ -363,7 +368,17 @@ def _extract_calls(body: str, base_pos: int, line_of, scope: Dict[str, str],
         add("api_generic", gen, m.group(1), gen, m.group(2).strip(), m.start())
     for m in STRING_CALL_RE.finditer(raw_body if raw_body is not None else body):
         add("api_string", m.group(1), "", "", m.group(2), m.start())
+    chain_spans = []
+    for m in CHAIN_CALL_RE.finditer(body):
+        owner, field, op = m.group(1), m.group(2), m.group(3)
+        chain_spans.append((m.start(), m.end()))
+        # 大写开头视为类型(静态字段 / 单例),任意末段方法都记,
+        # 不写死 AddListener/Dispatch 这类业务 API。
+        if owner not in CS_KEYWORDS and owner[:1].isupper() and op not in CS_KEYWORDS:
+            add("field_call", field, owner, owner, op, m.start())
     for m in DOTCALL_RE.finditer(body):
+        if any(s <= m.start() < e for s, e in chain_spans):
+            continue
         recv, meth = m.group(1), m.group(2)
         if meth in CS_KEYWORDS:
             continue

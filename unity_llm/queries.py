@@ -59,6 +59,43 @@ def _asset_node(row, **extra) -> Dict:
     return out
 
 
+def _guids_of_type(conn, full_name: str) -> List[str]:
+    """一个类型所有 partial 文件的 guid(prefab 挂的是带 MonoBehaviour 的那份)。"""
+    seen = []
+    for r in conn.execute(
+            "SELECT DISTINCT guid FROM types WHERE full_name=? AND guid!=''",
+            (full_name,)):
+        if r["guid"] not in seen:
+            seen.append(r["guid"])
+    return seen
+
+
+def _pick_primary_type_row(rows) -> Dict:
+    """partial 多行里挑展示用的主文件:有基类 / is_mono 的优先。"""
+    def score(r):
+        return (int(r["is_mono"] or 0), int(bool(r["bases"])),
+                -len(r["file"] or ""))
+    return max(rows, key=score)
+
+
+def _type_node_from_rows(rows) -> Dict:
+    primary = _pick_primary_type_row(rows)
+    files, guids = [], []
+    for r in rows:
+        if r["file"] and r["file"] not in files:
+            files.append(r["file"])
+        if r["guid"] and r["guid"] not in guids:
+            guids.append(r["guid"])
+    node = {"kind": "type", "id": primary["id"], "name": primary["name"],
+            "full_name": primary["full_name"], "file": primary["file"],
+            "guid": primary["guid"], "is_mono": int(any(r["is_mono"] for r in rows)),
+            "bases": primary["bases"] or next((r["bases"] for r in rows if r["bases"]), ""),
+            "guids": guids, "files": files}
+    if len(files) > 1:
+        node["partial"] = True
+    return node
+
+
 def resolve_target(conn, target: str) -> Dict:
     """把用户输入的目标解析成图里的节点(guid / 路径 / 类名 / 方法名)。
 
@@ -73,23 +110,32 @@ def resolve_target(conn, target: str) -> Dict:
     row = conn.execute("SELECT * FROM assets WHERE path=?", (t,)).fetchone()
     if row:
         return _asset_node(row)
+    # 增量删除保留 tombstone,使旧 guid/路径仍可解释已有的悬空入边。
+    if _has_table(conn, "deleted_assets"):
+        row = conn.execute(
+            "SELECT * FROM deleted_assets WHERE guid=? OR path=?"
+            " ORDER BY deleted_at DESC LIMIT 1", (t, t)).fetchone()
+        if row:
+            return _asset_node(row, deleted=True)
     # 类型优先于模糊路径,避免 "Enemy" 被匹配成 Enemy.cs
-    row = conn.execute("SELECT * FROM types WHERE full_name=? LIMIT 1", (t,)).fetchone()
-    if not row:
-        rows = conn.execute(
-            "SELECT * FROM types WHERE name=? ORDER BY external, length(full_name)",
-            (t,)).fetchall()
-        if len(rows) == 1:
-            row = rows[0]
-        elif rows:
-            return {"kind": "ambiguous", "of": "type",
-                    "candidates": [r["full_name"] for r in rows]}
-    if row:
-        return {"kind": "type", "id": row["id"], "name": row["name"],
-                "full_name": row["full_name"], "file": row["file"],
-                "guid": row["guid"], "is_mono": row["is_mono"],
-                "bases": row["bases"]}
-    # 方法名:允许 Owner.Method 写法
+    # 同 full_name 多行 = partial,合并而不是当成 ambiguous
+    rows = conn.execute(
+        "SELECT * FROM types WHERE full_name=? ORDER BY is_mono DESC, length(file)",
+        (t,)).fetchall()
+    if rows:
+        return _type_node_from_rows(rows)
+    rows = conn.execute(
+        "SELECT * FROM types WHERE name=? ORDER BY external, length(full_name)",
+        (t,)).fetchall()
+    if rows:
+        by_fn: Dict[str, List] = {}
+        for r in rows:
+            by_fn.setdefault(r["full_name"], []).append(r)
+        if len(by_fn) == 1:
+            return _type_node_from_rows(next(iter(by_fn.values())))
+        return {"kind": "ambiguous", "of": "type",
+                "candidates": list(by_fn.keys())}
+    # 方法名 / 字段名:允许 Owner.Method 或 Owner.Field
     owner_filter, mname = None, t
     if "." in t:
         owner_filter, mname = t.rsplit(".", 1)
@@ -103,8 +149,27 @@ def resolve_target(conn, target: str) -> Dict:
         return {"kind": "method", "owner": r["owner"], "name": r["name"],
                 "signature": r["signature"], "file": r["file"], "guid": r["guid"]}
     if rows:
+        # 同一 owner 的同名方法(partial 重复插入极少见)去重后再判
+        owners = list(dict.fromkeys(r["owner"] for r in rows))
+        if len(owners) == 1:
+            r = rows[0]
+            return {"kind": "method", "owner": r["owner"], "name": r["name"],
+                    "signature": r["signature"], "file": r["file"],
+                    "guid": r["guid"]}
         return {"kind": "ambiguous", "of": "method",
                 "candidates": [f"{r['owner']}.{r['name']}" for r in rows][:40]}
+    if owner_filter:
+        frows = conn.execute(
+            "SELECT * FROM members WHERE name=? AND kind='field'",
+            (mname,)).fetchall()
+        frows = [r for r in frows
+                 if r["owner"] == owner_filter
+                 or r["owner"].endswith("." + owner_filter)]
+        if frows:
+            r = frows[0]
+            return {"kind": "field", "owner": r["owner"], "name": r["name"],
+                    "signature": r["signature"], "file": r["file"],
+                    "guid": r["guid"]}
 
     # 模糊路径:同名候选可能有好几个(Texture/Shop、Script/Shop...)
     matched_by = "path_suffix"
@@ -155,7 +220,7 @@ def _fuzzy_hint(t: str, best, types: List[Dict], matched_by: str,
 
 
 def _type_scope(conn, node: Dict):
-    """目标涉及的 (类型 full_name 集合, 方法名集合, guid 集合)。"""
+    """目标涉及的 (类型 full_name 集合, 方法/字段名集合, guid 集合)。"""
     owners: Set[str] = set()
     names: Set[str] = set()
     guids: Set[str] = set()
@@ -169,12 +234,17 @@ def _type_scope(conn, node: Dict):
     elif node["kind"] == "type":
         owners.add(node["full_name"])
         short.add(node["name"])
-        if node["guid"]:
-            guids.add(node["guid"])
-    elif node["kind"] == "method":
+        for g in node.get("guids") or ([node["guid"]] if node.get("guid") else []):
+            if g:
+                guids.add(g)
+        if not guids:
+            guids.update(_guids_of_type(conn, node["full_name"]))
+    elif node["kind"] in ("method", "field"):
         owners.add(node["owner"])
         names.add(node["name"])
-        if node["guid"]:
+        short.add(node["owner"].split(".")[-1])
+        guids.update(_guids_of_type(conn, node["owner"]))
+        if node.get("guid"):
             guids.add(node["guid"])
         return owners, names, guids, short
     for o in list(owners):
@@ -197,6 +267,21 @@ def _unresolved_hint(node: Dict) -> str:
             "或确认图谱是否需要 unity_update / unity_rebuild。")
 
 
+def _present_node(node: Dict) -> Dict:
+    """对外只返回决策所需身份,隐藏查询内部 id/guid 并集等膨胀字段。"""
+    keep = {
+        "asset": ("kind", "path", "guid", "ext", "deleted", "fuzzy",
+                  "matched_by", "other_path_matches", "type_candidates"),
+        "type": ("kind", "name", "full_name", "file", "bases", "is_mono",
+                 "partial"),
+        "method": ("kind", "owner", "name", "signature", "file"),
+        "field": ("kind", "owner", "name", "signature", "file"),
+        "ambiguous": ("kind", "of", "candidates"),
+        "unknown": ("kind", "input"),
+    }.get(node.get("kind"), tuple(node))
+    return {k: node[k] for k in keep if k in node}
+
+
 def impact(project_root: str, target: str, depth: int = 3,
            include_low: bool = False, include_external: bool = False,
            limit: int = DEFAULT_LIMIT) -> Dict:
@@ -207,15 +292,16 @@ def impact(project_root: str, target: str, depth: int = 3,
     """
     conn = connect(project_root)
     node = resolve_target(conn, target)
-    out: Dict = {"target": target, "resolved": node, "code_dependents": [],
-                 "asset_dependents": [], "event_bindings": [], "transitive": [],
+    out: Dict = {"target": target, "resolved": _present_node(node),
+                 "code_dependents": [],
+                 "asset_dependents": [], "event_bindings": [],
                  "summary": {}}
-    if node["kind"] not in ("asset", "type", "method"):
+    if node["kind"] not in ("asset", "type", "method", "field"):
         conn.close()
         out["hint"] = _unresolved_hint(node)
         return out
     if node.get("hint"):
-        out["hint"] = node.pop("hint")  # 只留一份,别在 resolved 里重复占 token
+        out["hint"] = node["hint"]
 
     owners, names, guids, short = _type_scope(conn, node)
     confs = GOOD_CONF + ("low",) if include_low else GOOD_CONF
@@ -228,20 +314,23 @@ def impact(project_root: str, target: str, depth: int = 3,
     code: List[Dict] = []
     seen = set()
     for o in owners:
-        sql = ("SELECT DISTINCT src_owner, src_member, kind, name, file, line,"
+        sql = ("SELECT DISTINCT src_owner, src_member, kind, name, arg, file, line,"
                " confidence, external FROM calls WHERE resolved_owner=?"
                f" AND confidence IN ({conf_marks})")
         for c in conn.execute(sql, (o,) + confs):
             if c["external"] and not include_external:
                 continue
-            if node["kind"] == "method" and c["name"] not in names:
+            if node["kind"] in ("method", "field") and c["name"] not in names:
                 continue
-            key = (c["src_owner"], c["src_member"], c["name"])
+            key = (c["src_owner"], c["src_member"], c["name"], c["kind"])
             if key in seen:
                 continue
             seen.add(key)
+            called = (f"{c['name']}.{c['arg']}"
+                      if c["kind"] in ("field_call", "relay") and c["arg"]
+                      else c["name"])
             code.append({"caller": f"{c['src_owner']}.{c['src_member']}",
-                         "calls": c["name"], "via": c["kind"],
+                         "calls": called, "via": c["kind"],
                          "at": f"{c['file']}:{c['line']}",
                          "confidence": c["confidence"],
                          "scope": scope_of(c["src_owner"])})
@@ -266,7 +355,6 @@ def impact(project_root: str, target: str, depth: int = 3,
 
     # --- 资产依赖:引用这些 guid 的资产(传递闭包)
     assets: List[Dict] = []
-    transitive: List[Dict] = []
     visited: Set[str] = set()
     frontier = list(guids)
     d = 0
@@ -284,7 +372,6 @@ def impact(project_root: str, target: str, depth: int = 3,
                                "context": r["context"], "depth": d})
                 if r["src_guid"] and r["src_guid"] not in visited:
                     nxt.append(r["src_guid"])
-                    transitive.append({"path": r["src_path"], "depth": d})
         frontier = nxt
 
     # --- UnityEvent 绑定(按钮 onClick 之类,代码里看不见的调用者)
@@ -300,6 +387,19 @@ def impact(project_root: str, target: str, depth: int = 3,
             events.append({"asset": e["src_path"], "event": e["field"],
                            "method": e["method"], "on": e["context"]})
 
+    from .meta import load_config, path_matches
+    noise = list(load_config(project_root).get("dead_code_exclude") or [])
+    dropped_assets = 0
+    if noise:
+        kept = []
+        for a in assets:
+            if path_matches(a["asset"], noise):
+                dropped_assets += 1
+            else:
+                kept.append(a)
+        assets = kept
+        events = [e for e in events if not path_matches(e["asset"], noise)]
+
     conn.close()
     # 截断时外部调用方优先(内部自调用信息价值低,别占预算)
     ck = _cap(code, limit, key=lambda x: (0 if x["scope"] == "external" else 1,
@@ -310,17 +410,20 @@ def impact(project_root: str, target: str, depth: int = 3,
     out["code_dependents"] = ck["items"]
     out["asset_dependents"] = ak["items"]
     out["event_bindings"] = ek["items"]
-    out["transitive"] = transitive[:limit]
     ext_code = [c for c in code if c["scope"] == "external"]
     out["summary"] = {
         "code_dependents": len(code),
         "external_callers": len(ext_code),
         "internal_calls": len(code) - len(ext_code),
         "high_confidence": len([c for c in code if c["confidence"] == "high"]),
-        "direct_asset_dependents": len([a for a in assets if a["depth"] == 1]),
-        "transitive_assets": max(0, len(visited) - len(guids)),
+        "direct_asset_dependents": len({
+            a["asset"] for a in assets if a["depth"] == 1}),
+        "transitive_assets": len({
+            a["asset"] for a in assets if a["depth"] > 1}),
         "event_bindings": len(events),
     }
+    if dropped_assets:
+        out["summary"]["excluded_noise_assets"] = dropped_assets
     if code and not ext_code:
         out["summary"]["note_scope"] = (
             "代码依赖全部是内部自调用(这个类自己的方法互调),"
@@ -329,9 +432,6 @@ def impact(project_root: str, target: str, depth: int = 3,
                  ("event_bindings", ek)):
         if v["truncated"]:
             out["summary"].setdefault("truncated", {})[k] = v["truncated"]
-    if not include_low:
-        out["summary"]["note"] = ("仅返回 high/medium 置信度;low(接收者类型未知"
-                                  "且方法名重名)默认过滤,需要时传 include_low=true")
     return out
 
 
@@ -342,14 +442,14 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
     """「谁引用了这个资产 / 脚本」—— 序列化引用 + 代码引用,不展开传递。"""
     conn = connect(project_root)
     node = resolve_target(conn, target)
-    out: Dict = {"target": target, "resolved": node,
+    out: Dict = {"target": target, "resolved": _present_node(node),
                  "serialized_refs": [], "code_refs": [], "summary": {}}
-    if node["kind"] not in ("asset", "type", "method"):
+    if node["kind"] not in ("asset", "type", "method", "field"):
         conn.close()
         out["hint"] = _unresolved_hint(node)
         return out
     if node.get("hint"):
-        out["hint"] = node.pop("hint")  # 只留一份,别在 resolved 里重复占 token
+        out["hint"] = node["hint"]
     owners, names, guids, short = _type_scope(conn, node)
     confs = GOOD_CONF + ("low",) if include_low else GOOD_CONF
     conf_marks = ",".join("?" * len(confs))
@@ -361,10 +461,9 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
                 " ORDER BY src_path", (g,)):
             srefs.append(dict(r))
     crefs = []
-    # 目标是方法时必须按方法名过滤:否则「谁引用了 Foo.Bar」会把整个 Foo 类型
-    # 的所有调用边都端上来(实测某协议回调返回了同类里全部 Show/OnXxx 边)。
-    name_clause = " AND name=?" if node["kind"] == "method" else ""
-    name_args = (node["name"],) if node["kind"] == "method" else ()
+    # 目标是方法/字段时必须按名字过滤:否则会把整个类型的边都端上来。
+    name_clause = " AND name=?" if node["kind"] in ("method", "field") else ""
+    name_args = (node["name"],) if node["kind"] in ("method", "field") else ()
     for o in owners:
         for c in conn.execute(
                 "SELECT DISTINCT src_owner, src_member, kind, name, file, line,"
@@ -401,13 +500,13 @@ def components(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Di
     """prefab/scene 上挂了哪些脚本(m_Script 边),或某个脚本被谁挂载。"""
     conn = connect(project_root)
     node = resolve_target(conn, target)
-    out: Dict = {"target": target, "resolved": node}
-    if node["kind"] not in ("asset", "type", "method"):
+    out: Dict = {"target": target, "resolved": _present_node(node)}
+    if node["kind"] not in ("asset", "type", "method", "field"):
         conn.close()
         out["hint"] = _unresolved_hint(node)
         return out
     if node.get("hint"):
-        out["hint"] = node.pop("hint")  # 只留一份,别在 resolved 里重复占 token
+        out["hint"] = node["hint"]
     if node["kind"] == "asset" and node["ext"] in (".prefab", ".unity"):
         rows = conn.execute(
             "SELECT DISTINCT r.dst_guid g, r.context ctx, a.path p FROM refs r"
@@ -456,7 +555,7 @@ def dead_code(project_root: str, include_external: bool = False,
     """Unity 感知的死代码候选。
 
     排除:生命周期/消息回调、public/protected(可能是 API)、字符串调用、
-    **UnityEvent 绑定的方法(prefab/scene 里指名调用)**、序列化字段同名、
+    **UnityEvent 绑定的方法(prefab/scene 里指名调用)**、
     第三方目录、以及 `.unity-llm.json` 里 `dead_code_exclude` 配的路径
     (美术试验田 / Demo 这类项目内噪声目录,查询期过滤,不用重建图谱)。
 
@@ -472,7 +571,7 @@ def dead_code(project_root: str, include_external: bool = False,
     for c in conn.execute("SELECT DISTINCT name, arg, kind FROM calls"):
         if c["name"]:
             called.add(c["name"])
-        if c["kind"] == "api_string" and c["arg"]:
+        if c["kind"] in ("api_string", "field_call", "relay") and c["arg"]:
             called.add(c["arg"].split("(")[0])
     bound = {r["method"] for r in conn.execute("SELECT DISTINCT method FROM events")}
     serialized_fields = {r["field"] for r in
@@ -497,8 +596,6 @@ def dead_code(project_root: str, include_external: bool = False,
         if "private" not in mods and "internal" not in mods:
             continue
         if m["name"] in called or m["name"] in bound:
-            continue
-        if m["name"] in serialized_fields:
             continue
         if m["name"].startswith(("get_", "set_")) or m["name"] == ".ctor":
             continue
@@ -636,21 +733,51 @@ def validate(project_root: str, limit: int = DEFAULT_LIMIT) -> Dict:
 
 # ---------------------------------------------------------------- find/stats
 
-def find_symbols(project_root: str, pattern: str, limit: int = 30) -> Dict:
+def find_symbols(project_root: str, pattern: str, limit: int = 12,
+                 kind: str = None) -> Dict:
+    """按名字搜类型/成员/资产。默认精简索引,避免一次倒出几千 token。"""
     conn = connect(project_root)
     like = f"%{pattern}%"
-    types = [dict(r) for r in conn.execute(
-        "SELECT name, full_name, kind, file, line FROM types"
-        " WHERE name LIKE ? OR full_name LIKE ? ORDER BY external, length(name)"
-        " LIMIT ?", (like, like, limit))]
-    members = [dict(r) for r in conn.execute(
-        "SELECT owner, kind, name, signature, file, line FROM members"
-        " WHERE name LIKE ? ORDER BY external LIMIT ?", (like, limit))]
-    assets = [dict(r) for r in conn.execute(
-        "SELECT path, ext FROM assets WHERE path LIKE ? ORDER BY external,"
-        " length(path) LIMIT ?", (like, limit))]
+    want = {kind} if kind in ("type", "member", "asset") else {
+        "type", "member", "asset"}
+    out: Dict = {}
+    if "type" in want:
+        rows = conn.execute(
+            "SELECT name, full_name, kind, file FROM types"
+            " WHERE name LIKE ? OR full_name LIKE ? ORDER BY external, length(name)"
+            " LIMIT ?", (like, like, limit * 3)).fetchall()
+        seen = set()
+        types = []
+        for r in rows:
+            if r["full_name"] in seen:
+                continue
+            seen.add(r["full_name"])
+            types.append({"name": r["name"], "full_name": r["full_name"],
+                          "kind": r["kind"], "file": r["file"]})
+            if len(types) >= limit:
+                break
+        out["types"] = types
+    if "member" in want:
+        members = [{"owner": r["owner"], "kind": r["kind"], "name": r["name"],
+                    "file": r["file"]}
+                   for r in conn.execute(
+                       "SELECT owner, kind, name, file FROM members"
+                       " WHERE name LIKE ? OR owner LIKE ?"
+                       " ORDER BY external LIMIT ?",
+                       (like, like, limit))]
+        out["members"] = members
+    if "asset" in want:
+        assets = [{"path": r["path"], "ext": r["ext"]}
+                  for r in conn.execute(
+                      "SELECT path, ext FROM assets WHERE path LIKE ?"
+                      " ORDER BY CASE ext"
+                      " WHEN '.cs' THEN 0 WHEN '.prefab' THEN 1"
+                      " WHEN '.unity' THEN 2 WHEN '.asset' THEN 3 ELSE 9 END,"
+                      " external, length(path) LIMIT ?",
+                      (like, limit))]
+        out["assets"] = assets
     conn.close()
-    return {"types": types, "members": members, "assets": assets}
+    return out
 
 
 def stats(project_root: str) -> Dict:
@@ -673,6 +800,9 @@ def stats(project_root: str) -> Dict:
             "SELECT count(*) FROM assets WHERE ext IN ('.prefab','.unity')"),
         "external_types": one("SELECT count(*) FROM types WHERE external=1"),
     }
+    out["deleted_asset_tombstones"] = (
+        one("SELECT count(*) FROM deleted_assets")
+        if _has_table(conn, "deleted_assets") else 0)
     out["call_confidence"] = {
         r["confidence"]: r["c"] for r in conn.execute(
             "SELECT confidence, count(*) c FROM calls GROUP BY confidence")}
