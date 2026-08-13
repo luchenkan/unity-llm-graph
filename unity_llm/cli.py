@@ -53,12 +53,15 @@ def cmd_impact(args) -> int:
 def cmd_refs(args) -> int:
     _print(args, queries.find_refs(_project(args), args.target,
                                    include_low=args.include_low,
+                                   include_external=args.include_external,
                                    limit=args.limit))
     return 0
 
 
 def cmd_components(args) -> int:
-    _print(args, queries.components(_project(args), args.target, limit=args.limit))
+    _print(args, queries.components(_project(args), args.target,
+                                    include_external=args.include_external,
+                                    limit=args.limit))
     return 0
 
 
@@ -138,6 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="unity-llm",
         description="Unity 依赖图谱:让 LLM 同时看懂 C# 代码与 prefab/scene 序列化引用")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--debug", action="store_true",
+                   help="出错时显示完整 Python 堆栈(默认只打印人话错误)")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_project(sp):
@@ -184,6 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_project(sp)
     sp.add_argument("--target", required=True)
     add_low(sp)
+    add_external(sp)
     add_limit(sp)
     sp.set_defaults(func=cmd_refs)
 
@@ -191,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="组件清单:prefab 挂了哪些脚本 / 脚本被谁挂载")
     add_project(sp)
     sp.add_argument("--target", required=True)
+    add_external(sp)
     add_limit(sp)
     sp.set_defaults(func=cmd_components)
 
@@ -255,7 +262,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except RuntimeError as e:
+    except KeyboardInterrupt:
+        print("已取消", file=sys.stderr)
+        return 130
+    except Exception as e:
+        if getattr(args, "debug", False):
+            raise
         print(f"错误: {e}", file=sys.stderr)
         return 2
 

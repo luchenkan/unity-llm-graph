@@ -27,6 +27,8 @@ _TARGET_DESC = "类名(Enemy)/方法名(TakeDamage 或 Enemy.TakeDamage)/资产�
 _LOW = {"type": "boolean", "default": False,
         "description": "是否包含 low 置信度(接收者类型未知且方法名重名)的调用边,"
                        "默认 false —— 打开通常会多出成百上千条名字碰撞噪声"}
+_EXTERNAL = {"type": "boolean", "default": False,
+             "description": "是否包含 3rd/Plugins/Packages 等第三方目录的结果"}
 
 TOOLS = [
     {
@@ -53,6 +55,7 @@ TOOLS = [
                 "depth": {"type": "integer", "default": 3,
                           "description": "资产级传递深度,默认 3"},
                 "include_low": _LOW,
+                "include_external": _EXTERNAL,
                 "limit": {"type": "integer", "default": 8,
                           "description": "每个分区最多返回条数"},
             },
@@ -72,6 +75,7 @@ TOOLS = [
             "properties": {
                 "target": {"type": "string", "description": _TARGET_DESC},
                 "include_low": _LOW,
+                "include_external": _EXTERNAL,
                 "limit": {"type": "integer", "default": 12},
             },
             "required": ["target"],
@@ -88,6 +92,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": _TARGET_DESC},
+                "include_external": _EXTERNAL,
                 "limit": {"type": "integer", "default": 20},
             },
             "required": ["target"],
@@ -121,8 +126,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "include_external": {"type": "boolean", "default": False,
-                                     "description": "是否包含 3rd/Plugins/Packages"},
+                "include_external": _EXTERNAL,
                 "exclude": {"type": "array", "items": {"type": "string"},
                             "description": "额外排除的路径片段或前缀,如 "
                                            "[\"ART_TEST\", \"Assets/Demo\"]"},
@@ -271,6 +275,7 @@ def make_dispatcher(project_root: str,
             return {"ok": True, "stats": graph.build(project_root)}
         need_graph()
         low = bool(args.get("include_low", False))
+        ext = bool(args.get("include_external", False))
         limit = int(args.get("limit", _DEFAULT_LIMITS.get(
             name, queries.DEFAULT_LIMIT)))
         if name == "unity_stats":
@@ -278,12 +283,15 @@ def make_dispatcher(project_root: str,
         elif name == "unity_impact":
             out = queries.impact(project_root, args["target"],
                                  depth=int(args.get("depth", 3)),
-                                 include_low=low, limit=limit)
+                                 include_low=low,
+                                 include_external=ext, limit=limit)
         elif name == "unity_refs":
             out = queries.find_refs(project_root, args["target"],
-                                    include_low=low, limit=limit)
+                                    include_low=low,
+                                    include_external=ext, limit=limit)
         elif name == "unity_components":
-            out = queries.components(project_root, args["target"], limit=limit)
+            out = queries.components(project_root, args["target"],
+                                     include_external=ext, limit=limit)
         elif name == "unity_find":
             out = queries.find_symbols(project_root, args["pattern"],
                                        limit=int(args.get(
@@ -292,7 +300,7 @@ def make_dispatcher(project_root: str,
         elif name == "unity_dead_code":
             out = queries.dead_code(
                 project_root,
-                include_external=bool(args.get("include_external", False)),
+                include_external=ext,
                 limit=limit, exclude=args.get("exclude") or None)
         elif name == "unity_validate":
             out = queries.validate(project_root, limit=limit)

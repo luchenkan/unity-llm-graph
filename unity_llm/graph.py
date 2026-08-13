@@ -167,7 +167,12 @@ def _connect_path(path: str) -> sqlite3.Connection:
 
 
 def connect(project_root: str) -> sqlite3.Connection:
-    return _connect_path(db_path(project_root))
+    path = db_path(os.path.abspath(project_root))
+    if not os.path.exists(path):
+        raise RuntimeError(
+            "图谱不存在,请先运行: "
+            f"python -m unity_llm build --project \"{os.path.abspath(project_root)}\"")
+    return _connect_path(path)
 
 
 def ensure_schema(project_root: str) -> None:

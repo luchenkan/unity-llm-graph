@@ -3,7 +3,7 @@
 Brief for later reviewers. Do not treat README or the 5-script fixture as the product.
 
 Framework: **unity-llm-graph** `0.7.0`  
-Repo: https://github.com/luchenkan/unity-llm-graph (private)  
+Repo: https://github.com/luchenkan/unity-llm-graph
 Constraint: zero runtime deps, Python ≥ 3.9, stdlib only.
 
 ## What this is (and is not)
@@ -153,3 +153,29 @@ Still deliberately not implemented (unchanged from Round 6):
 - Roslyn-quality `using` alias/generic/extension-method resolution.
 
 Review completed by **DeepSeek-V4-Pro**.
+
+## Round 8 — pre-public hygiene pass
+
+Reviewed the repository as the final pass before making it public, not as another
+feature review:
+
+1. **Version drift.** `pyproject.toml` still said `0.6.0` while `unity_llm`
+   and `README.md` described `0.7.0`. Package metadata now reads the single
+   source of truth from `unity_llm.__version__`.
+2. **Missing graph could create an empty DB.** `graph.connect()` opened SQLite in
+   read-write mode even for pure queries, so a CLI query on a project without
+   `.unity-llm/graph.db` would silently create an empty database and return empty
+   results. `connect()` now fails fast with a `build` instruction.
+3. **`include_external` was half-applied.** `impact` filtered code callers but not
+   asset/UnityEvent channels, and `refs` / `components` had no switch at all.
+   The flag is now honored consistently across `impact`, `refs`, `components`,
+   CLI, and the MCP tool schemas.
+4. **CLI errors could traceback.** `cli.main()` only caught `RuntimeError`;
+   SQLite/OS/value errors surfaced as raw Python tracebacks. It now prints a
+   concise error and exit code by default, with `--debug` for full stack traces.
+5. **Leak check.** Searched tracked files and Git history for project-specific
+   names/paths from the test game, credentials, tokens, and local absolute paths;
+   none were found. The only personal identifier is the intended public remote
+   URL/username.
+
+Re-ran `python tests/run_tests.py`: **142 assertions / 25 groups passing**.

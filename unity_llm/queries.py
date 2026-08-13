@@ -368,8 +368,11 @@ def impact(project_root: str, target: str, depth: int = 3,
                 continue
             visited.add(g)
             for r in conn.execute(
-                    "SELECT DISTINCT src_guid, src_path, field, context FROM refs"
-                    " WHERE dst_guid=?", (g,)):
+                    "SELECT DISTINCT r.src_guid, r.src_path, r.field, r.context,"
+                    " a.external AS src_external FROM refs r"
+                    " LEFT JOIN assets a ON a.guid=r.src_guid WHERE r.dst_guid=?", (g,)):
+                if r["src_external"] and not include_external:
+                    continue
                 assets.append({"asset": r["src_path"], "field": r["field"],
                                "context": r["context"], "depth": d})
                 if r["src_guid"] and r["src_guid"] not in visited:
@@ -380,8 +383,11 @@ def impact(project_root: str, target: str, depth: int = 3,
     events: List[Dict] = []
     for name in names:
         for e in conn.execute(
-                "SELECT DISTINCT src_path, field, method, target_type, context"
-                " FROM events WHERE method=?", (name,)):
+                "SELECT DISTINCT e.src_path, e.field, e.method, e.target_type,"
+                " e.context, a.external AS src_external FROM events e"
+                " LEFT JOIN assets a ON a.guid=e.src_guid WHERE e.method=?", (name,)):
+            if e["src_external"] and not include_external:
+                continue
             if e["target_type"] and owners and not any(
                     e["target_type"] == o or e["target_type"].endswith("." + o)
                     or o.endswith("." + e["target_type"]) for o in owners):
@@ -440,6 +446,7 @@ def impact(project_root: str, target: str, depth: int = 3,
 # ---------------------------------------------------------------- refs
 
 def find_refs(project_root: str, target: str, include_low: bool = False,
+              include_external: bool = False,
               limit: int = DEFAULT_LIMIT) -> Dict:
     """「谁引用了这个资产 / 脚本」—— 序列化引用 + 代码引用,不展开传递。"""
     conn = connect(project_root)
@@ -459,9 +466,13 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
     srefs = []
     for g in guids:
         for r in conn.execute(
-                "SELECT src_path, field, context FROM refs WHERE dst_guid=?"
-                " ORDER BY src_path", (g,)):
-            srefs.append(dict(r))
+                "SELECT r.src_path, r.field, r.context, a.external AS src_external"
+                " FROM refs r LEFT JOIN assets a ON a.guid=r.src_guid"
+                " WHERE r.dst_guid=? ORDER BY r.src_path", (g,)):
+            if r["src_external"] and not include_external:
+                continue
+            srefs.append({"src_path": r["src_path"], "field": r["field"],
+                          "context": r["context"]})
     crefs = []
     # 目标是方法/字段时必须按名字过滤:否则会把整个类型的边都端上来。
     name_clause = " AND name=?" if node["kind"] in ("method", "field") else ""
@@ -469,9 +480,11 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
     for o in owners:
         for c in conn.execute(
                 "SELECT DISTINCT src_owner, src_member, kind, name, file, line,"
-                f" confidence FROM calls WHERE resolved_owner=?"
+                f" confidence, external FROM calls WHERE resolved_owner=?"
                 f" AND confidence IN ({conf_marks}){name_clause}",
                 (o,) + confs + name_args):
+            if c["external"] and not include_external:
+                continue
             crefs.append({"caller": f"{c['src_owner']}.{c['src_member']}",
                           "calls": c["name"], "kind": c["kind"],
                           "at": f"{c['file']}:{c['line']}",
@@ -578,7 +591,9 @@ def _build_hierarchy_text(conn, src_guid: str):
     return "\n".join(lines), len(go_name)
 
 
-def components(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict:
+def components(project_root: str, target: str,
+               include_external: bool = False,
+               limit: int = DEFAULT_LIMIT) -> Dict:
     """prefab/scene 上挂了哪些脚本(m_Script 边),或某个脚本被谁挂载。"""
     conn = connect(project_root)
     node = resolve_target(conn, target)
@@ -616,8 +631,13 @@ def components(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Di
         items = []
         for g in guids:
             for r in conn.execute(
-                    "SELECT DISTINCT src_path, context FROM refs"
-                    " WHERE dst_guid=? AND field='m_Script' ORDER BY src_path", (g,)):
+                    "SELECT DISTINCT r.src_path, r.context,"
+                    " a.external AS src_external FROM refs r"
+                    " LEFT JOIN assets a ON a.guid=r.src_guid"
+                    " WHERE r.dst_guid=? AND r.field='m_Script'"
+                    " ORDER BY r.src_path", (g,)):
+                if r["src_external"] and not include_external:
+                    continue
                 items.append({"asset": r["src_path"], "on": r["context"]})
         cap = _cap(items, limit)
         out["mounted_on"] = cap["items"]

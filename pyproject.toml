@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unity-llm-graph"
-version = "0.6.0"
+dynamic = ["version"]
 description = "Unity-aware dependency graph and context engine for LLMs (code + serialized references)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -24,8 +24,16 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 
+[project.urls]
+Homepage = "https://github.com/luchenkan/unity-llm-graph"
+Repository = "https://github.com/luchenkan/unity-llm-graph"
+Issues = "https://github.com/luchenkan/unity-llm-graph/issues"
+
 [project.scripts]
 unity-llm = "unity_llm.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "unity_llm.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["unity_llm*"]
