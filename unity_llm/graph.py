@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -192,9 +193,38 @@ def _asset_ext(path: str) -> str:
     return os.path.splitext(path)[1].lower()
 
 
+class _Progress:
+    """全量 build 的 stderr 心跳。默认关闭,避免库调用/测试被刷屏。
+
+    中型项目初次建图要扫完全部 .meta,期间如果没有任何输出,用户会以为卡住。
+    写 stderr + flush,不污染 stdout 的最终 JSON。
+    """
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.t0 = time.time()
+        self._last = self.t0
+
+    def log(self, msg: str) -> None:
+        if not self.enabled:
+            return
+        elapsed = time.time() - self.t0
+        print(f"build: {msg}  ({elapsed:.0f}s)", file=sys.stderr, flush=True)
+        self._last = time.time()
+
+    def maybe(self, n: int, total: int, label: str, every_sec: float = 5.0) -> None:
+        if not self.enabled:
+            return
+        now = time.time()
+        if (now - self._last) < every_sec:
+            return
+        extra = f"{n}/{total}" if total else str(n)
+        self.log(f"{label} {extra}")
+
+
 # ------------------------------------------------------------------ 解析调用边
 
-def _resolve_calls(cur) -> Dict[str, int]:
+def _resolve_calls(cur, progress: Optional[_Progress] = None) -> Dict[str, int]:
     """建图后一次性解析所有调用边,写回 resolved_owner / confidence。"""
     type_by_short: Dict[str, List[str]] = {}
     bases_of: Dict[str, List[str]] = {}
@@ -286,12 +316,17 @@ def _resolve_calls(cur) -> Dict[str, int]:
 
     updates = []
     counts = {"high": 0, "medium": 0, "low": 0}
+    total = cur.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
+    n = 0
     for r in cur.execute(
             "SELECT id, src_owner, kind, name, recv_type FROM calls"):
         owner, conf = resolve(r["kind"], r["name"], r["recv_type"],
                               r["src_owner"])
         counts[conf] += 1
         updates.append((owner, conf, r["id"]))
+        n += 1
+        if progress is not None:
+            progress.maybe(n, total, "[6/6] 解析调用边")
     cur.executemany("UPDATE calls SET resolved_owner=?, confidence=? WHERE id=?",
                     updates)
     return counts
@@ -414,8 +449,13 @@ def build(project_root: str, verbose: bool = False,
     root = os.path.abspath(project_root)
     os.makedirs(os.path.join(root, DB_DIR), exist_ok=True)
     t0 = time.time()
+    prog = _Progress(verbose)
+    prog.log("开始全量建图(中型项目约 8-10 分钟,stderr 有进度,不是卡住)")
 
-    guid_map, guid_source = build_guid_map(root)
+    prog.log("[1/6] 扫描 .meta 建立 guid 映射")
+    guid_map, guid_source = build_guid_map(
+        root, on_tick=lambda n: prog.maybe(n, 0, "[1/6] .meta"))
+    prog.log(f"[1/6] guid 映射完成 {len(guid_map)} 条")
 
     final_path = db_path(root)
     building_path = final_path + ".building"
@@ -445,6 +485,7 @@ def build(project_root: str, verbose: bool = False,
              "calls": 0, "yaml_assets": 0, "refs": 0, "events": 0, "errors": 0}
 
     # 1) 资产表
+    prog.log(f"[2/6] 写入资产表 {len(guid_map)}")
     path_to_guid = {}
     for guid, rel in guid_map.items():
         path_to_guid[rel] = guid
@@ -460,7 +501,18 @@ def build(project_root: str, verbose: bool = False,
                 "(guid,path,ext,deleted_at) VALUES (?,?,?,?)",
                 (r["guid"], r["path"], r["ext"], r["deleted_at"]))
 
+    cs_total = 0
+    yaml_total = 0
+    for rel in path_to_guid:
+        ext = _asset_ext(rel)
+        if ext in SCRIPT_EXTS:
+            if include_external_code or not is_external(rel, root):
+                cs_total += 1
+        elif ext in YAML_ASSET_EXTS:
+            yaml_total += 1
+
     # 2) C# 代码图
+    prog.log(f"[3/6] 解析 C# ({cs_total} 脚本)")
     for abspath, rel in iter_assets(root):
         ext = _asset_ext(rel)
         if ext not in SCRIPT_EXTS:
@@ -479,8 +531,11 @@ def build(project_root: str, verbose: bool = False,
         stats["types"] += n["types"]
         stats["members"] += n["members"]
         stats["calls"] += n["calls"]
+        prog.maybe(stats["scripts"], cs_total, "[3/6] C#")
+    prog.log(f"[3/6] C# 完成 {stats['scripts']} 脚本")
 
     # 3) 序列化引用图 + UnityEvent 绑定
+    prog.log(f"[4/6] 解析 YAML ({yaml_total} prefab/scene/asset)")
     for abspath, rel in iter_assets(root):
         ext = _asset_ext(rel)
         if ext not in YAML_ASSET_EXTS:
@@ -495,24 +550,32 @@ def build(project_root: str, verbose: bool = False,
         stats["yaml_assets"] += 1
         stats["refs"] += n["refs"]
         stats["events"] += n["events"]
+        prog.maybe(stats["yaml_assets"], yaml_total, "[4/6] YAML")
+    prog.log(f"[4/6] YAML 完成 {stats['yaml_assets']} 资产")
 
     # 4) 自定义 MB 基类链(BasePage : GameBehaviour : MonoBehaviour)
+    prog.log("[5/6] 传播 MonoBehaviour 标记")
     _propagate_mono(cur)
 
     # 5) 调用边解析(接收者类型 -> 基类链 -> 真正的被调类型)
-    stats["confidence"] = _resolve_calls(cur)
+    prog.log("[6/6] 解析调用边")
+    stats["confidence"] = _resolve_calls(cur, progress=prog)
 
     for k, v in (("built_at", str(int(time.time()))), ("version", __version__),
                  ("guid_source", guid_source)):
         cur.execute("INSERT OR REPLACE INTO meta_kv(key, value) VALUES (?,?)",
                     (k, v))
     # 批量插入后再建索引,避免每行维护 B-tree。
+    prog.log("建索引并落盘")
     cur.executescript(INDEX_SCHEMA)
     conn.commit()
     conn.close()
     os.replace(building_path, final_path)
     stats["guid_source"] = guid_source
     stats["seconds"] = round(time.time() - t0, 2)
+    prog.log(
+        f"完成 {stats['seconds']}s  assets={stats['assets']} "
+        f"scripts={stats['scripts']} yaml={stats['yaml_assets']}")
     return stats
 
 

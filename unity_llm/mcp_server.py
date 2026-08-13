@@ -262,8 +262,10 @@ def make_dispatcher(project_root: str,
         nonlocal checked_schema
         if not graph.has_graph(project_root):
             raise RuntimeError(
-                "图谱不存在。全量建图可能耗时较长,MCP 不会隐式执行;请先运行 "
-                f"`python -m unity_llm build --project \"{project_root}\"`。")
+                "图谱不存在。全量建图可能耗时较长(中型项目约 8-10 分钟),"
+                "MCP 不会隐式执行;请先运行 "
+                f"`python -m unity_llm build --project \"{project_root}\"`"
+                "(期间 stderr 会输出进度,不是卡住)。")
         if not checked_schema:
             graph.ensure_schema(project_root)
             checked_schema = True
@@ -272,7 +274,7 @@ def make_dispatcher(project_root: str,
         if allowed_tools is not None and name not in allowed_tools:
             raise ValueError(f"工具 `{name}` 不在当前 MCP profile 中")
         if name == "unity_rebuild":
-            return {"ok": True, "stats": graph.build(project_root)}
+            return {"ok": True, "stats": graph.build(project_root, verbose=True)}
         need_graph()
         low = bool(args.get("include_low", False))
         ext = bool(args.get("include_external", False))

@@ -164,7 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--include-external", action="store_true",
                         help="包含 3rd/Plugins/Packages 等第三方目录的结果")
 
-    sp = sub.add_parser("build", help="构建/重建依赖图谱")
+    sp = sub.add_parser("build",
+                        help="构建/重建依赖图谱(中型项目约 8-10 分钟,stderr 有进度)")
     add_project(sp)
     sp.add_argument("--no-external-code", action="store_true",
                     help="不解析第三方目录里的 C#(建图更快,但第三方对你代码的"

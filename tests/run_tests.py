@@ -19,6 +19,7 @@
  16. guid    非标准 guid 告警只在真有影响时出现
  17. method_ref 委托/方法组引用(Register(OnFoo) / evt += OnFoo)算被使用
  18. parser  注释/字符串同遍遮罩(URL 里的 // 不能吃掉后面的代码)
+ 19. build   verbose 进度写 stderr,默认安静
 """
 import base64
 import json
@@ -30,6 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from unity_llm import graph, queries, context as context_mod  # noqa: E402
+from unity_llm import __version__  # noqa: E402
 from unity_llm.mcp_server import TOOLS, make_dispatcher, tools_for_profile  # noqa: E402
 from unity_llm.tokens import estimate_tokens  # noqa: E402
 
@@ -328,7 +330,7 @@ def test_update():
         check("两个文件更新成功且无错误",
               len(r["updated"]) == 2 and not r["errors"], str(r))
         check("增量更新同步 schema 版本",
-              queries.stats(dst)["version"] == "0.7.0")
+              queries.stats(dst)["version"] == __version__)
         d = queries.dead_code(dst)
         methods = {m["method"] for m in d["dead_methods"]}
         check("新方法名进入死代码", any("NewDeadMethod" in m for m in methods),
@@ -662,7 +664,7 @@ def test_atomic_build():
         before = queries.stats(dst)["scripts"]
         old = graph._resolve_calls
 
-        def fail_after_parse(cur):
+        def fail_after_parse(cur, progress=None):
             raise RuntimeError("synthetic build failure")
 
         graph._resolve_calls = fail_after_parse
@@ -715,6 +717,24 @@ def test_hierarchy():
     check("BattleCoreGO 挂 BattleCore.cs", "BattleCore.cs" in h3, str(h3))
 
 
+def test_build_progress():
+    print("[26] build 进度输出")
+    import io
+    from contextlib import redirect_stderr
+    quiet = io.StringIO()
+    with redirect_stderr(quiet):
+        graph.build(FIXTURE, verbose=False)
+    check("默认不打进度", "build:" not in quiet.getvalue(), quiet.getvalue()[:200])
+    buf = io.StringIO()
+    with redirect_stderr(buf):
+        graph.build(FIXTURE, verbose=True)
+    text = buf.getvalue()
+    check("进度写到 stderr", "build:" in text, text[:300])
+    check("有 guid 扫描阶段", "[1/6]" in text, text[:500])
+    check("有 C# 阶段", "[3/6]" in text, text[:800])
+    check("有完成行", "完成" in text, text[-400:])
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -728,7 +748,8 @@ def main():
              test_caller_scope, test_deadcode_exclude, test_project_config,
              test_guid_warning_precision, test_method_ref,
              test_parser_masking, test_partial_and_relay,
-             test_correctness_hardening, test_atomic_build, test_hierarchy]
+             test_correctness_hardening, test_atomic_build, test_hierarchy,
+             test_build_progress]
     failed = 0
     for t in tests:
         try:

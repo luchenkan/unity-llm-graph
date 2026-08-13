@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-142%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-147%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / methods / calls / inheritance / engine lifecycle callbacks)
@@ -68,7 +68,8 @@ Unity 恰恰是个反例——最要命的耦合写在 **prefab / scene 的 YAML
 git clone https://github.com/luchenkan/unity-llm-graph.git
 cd unity-llm-graph
 
-# 1. 对你的 Unity 项目建图(几秒到几十秒,取决于项目规模)
+# 1. 对你的 Unity 项目建图(首次全量扫描;中型项目约 8-10 分钟)
+#    期间 stderr 会打进度,不是卡住
 python -m unity_llm build --project /path/to/YourUnityProject
 
 # 2. 立刻可用
@@ -84,7 +85,8 @@ python -m unity_llm validate --project /path/to/YourUnityProject
 **资产路径**(`Assets/Scripts/Enemy.cs`)、**guid**(`e10000...`)。
 
 图谱落在 `<项目>/.unity-llm/graph.db`,建议把 `.unity-llm/` 加进 `.gitignore`。
-体积参考:3.75 万资产 / 1 万脚本的项目约 **200 MB**,全量重建约 60 秒。
+体积参考(实测中型商业项目):**3.75 万资产 / 6 千脚本**,`graph.db` 约 **250 MB**,
+初次全量建图约 **8-10 分钟**(本机 519 秒)。之后日常改动用 `update` 增量更新(秒级)。
 
 ### Quick Start (English)
 
@@ -94,7 +96,7 @@ Zero third-party deps, Python ≥ 3.9 (standard library only).
 git clone https://github.com/luchenkan/unity-llm-graph.git
 cd unity-llm-graph
 
-# 1. Build the graph for your Unity project (seconds to ~1 min)
+# 1. First build (mid-size project ≈ 8–10 min; stderr prints progress)
 python -m unity_llm build --project /path/to/YourUnityProject
 
 # 2. Query it
@@ -108,7 +110,8 @@ python -m unity_llm init-config --project /path/to/YourUnityProject
 
 `--target` accepts a **type name**, a **method name** (`Type.Method` for an exact
 member), an **asset path**, or a raw **guid**. The graph lives in
-`<project>/.unity-llm/graph.db` (~200 MB for a 37.5k-asset project) — gitignore it.
+`<project>/.unity-llm/graph.db` (~250 MB for a 37.5k-asset / 6k-script mid-size
+project; first build ≈ 8–10 min) — gitignore it.
 If your `.meta` GUIDs were rewritten by an asset-protection tool, see
 [the GUID map section](#特殊情况meta-guid-被改写过的项目).
 
@@ -229,8 +232,8 @@ python -m unity_llm context --project /path/to/Proj --target Enemy --budget 1500
 | `unity_rebuild`    | 全量重建图谱(`admin/full` profile)                                     |
 | `unity_update`     | **增量更新**:改了几个文件后只重建它们(秒级),支持修改/新增/删除                            |
 
-MCP 查询不会隐式触发全量建图。首次使用先显式运行 `build`;这样 1 分钟级扫描不会
-在一个看似只读的工具调用里超时。`rebuild` 只在 `admin/full` profile 暴露。
+MCP 查询不会隐式触发全量建图。首次使用先显式运行 `build`;中型项目大约 8-10 分钟,
+期间 stderr 有进度输出,避免看起来像卡住。`rebuild` 只在 `admin/full` profile 暴露。
 
 ## 让模型真的用上它(重要)
 
@@ -402,7 +405,7 @@ python tests/run_tests.py
 死代码误报控制、**方法组引用(`method_ref`)**、**解析器注释/字符串遮蔽回归**、
 悬空引用体检、上下文打包、MCP 握手与 `tools/call`、**增量更新(改/增/删)**
 并覆盖 partial、namespace 重名、原子 build、tombstone、MCP profile 和严格
-token 预算。共 **142 项断言 / 25 个测试组**。
+token 预算。共 **147 项断言 / 26 个测试组**。
 
 ## 能力与局限(诚实声明)
 
@@ -417,10 +420,21 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 - 反射、热更框架(HybridCLR / xLua / ILRuntime)、Timeline / Animation Event 入口
   **静态分析天然不可见**,dead-code 结果永远需要人工复核(工具自带免责声明);
 - 字符串耦合(`SendMessage`、`transform.Find` 路径)能检出,但无法验证目标存在性;
-- 全量重建大项目(3.75 万资产 / 1 万脚本量级)约 60 秒,`graph.db` 约 200 MB;
+- 全量重建中型项目(3.75 万资产 / 6 千脚本,实测)约 8-10 分钟,`graph.db` 约 250 MB;
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
 
 ## Changelog
+
+### 0.7.1
+
+全量 `build` 的用户体验:中型项目从 0 建图要数分钟,以前中途零输出,看起来像卡住。
+
+- **stderr 进度心跳**:`python -m unity_llm build` 默认 `verbose=True`,按阶段打印
+  `[1/6] 扫描 .meta` → C# → YAML → 调用边解析,每 5 秒刷新当前计数并 `flush`。
+  进度走 stderr,不污染 stdout 的最终 JSON。库调用默认仍然安静。
+- **耗时口径改成实测**:3.75 万资产 / 6 千脚本的中型项目初次建图约 **8-10 分钟**
+  (本机 519 秒),`graph.db` 约 **250 MB**。原先「约 60 秒」偏低。
+- MCP 缺图提示同步写上预估时间和「不是卡住」。
 
 ### 0.7.0
 
@@ -533,7 +547,7 @@ fileID 对象图:
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 142 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 147 项断言全绿。
 
 历次模型评审记录见 [REVIEWS.md](REVIEWS.md)(Kimi k3 / Claude Opus 5 /
 Cursor Grok 4.6 / GPT-5.6 Sol)。下一轮请对着真实项目和 `calls.log` 审,

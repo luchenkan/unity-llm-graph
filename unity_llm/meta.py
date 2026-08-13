@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Dict, Iterator, Tuple
+from typing import Callable, Dict, Iterator, Optional, Tuple
 
 # Unity 原生是 32 位十六进制;部分项目(加密/重写工具)是 40~64 位 Base64 风格长串
 _GUID_BODY = r"(?:[0-9a-fA-F]{32}|[A-Za-z0-9+/]{40,64}={0,2})"
@@ -148,18 +148,25 @@ def load_guid_override(root: str) -> Dict[str, str]:
     return out
 
 
-def build_guid_map(root: str, exclude_dirs=None) -> Tuple[Dict[str, str], str]:
+def build_guid_map(root: str, exclude_dirs=None,
+                   on_tick: Optional[Callable[[int], None]] = None
+                   ) -> Tuple[Dict[str, str], str]:
     """返回 ({guid: 相对资产路径}, 来源说明)。
 
     来源优先级:`.unity-llm/guidmap.tsv`(Unity 导出,权威) > .meta 扫描。
     两者会合并 —— 导出表覆盖 meta,meta 补齐导出表没有的(如包内资产)。
+    on_tick(n) 每处理一个 .meta 回调一次,给全量 build 打进度。
     """
     guid_map: Dict[str, str] = {}
+    n = 0
     for path in iter_files(root, exclude_dirs):
         if path.endswith(".meta"):
             g = _guid_of_meta(path)
             if g:
                 guid_map[g] = relpath(root, path[:-5])  # 去掉 .meta
+            n += 1
+            if on_tick:
+                on_tick(n)
     # 引擎包:只收 guid,保证 prefab 里对 TMP/UGUI 的引用能落地
     for sub in PACKAGE_META_ROOTS:
         base = os.path.join(root, sub)
@@ -173,6 +180,9 @@ def build_guid_map(root: str, exclude_dirs=None) -> Tuple[Dict[str, str], str]:
                 g = _guid_of_meta(p)
                 if g:
                     guid_map.setdefault(g, relpath(root, p[:-5]))
+                n += 1
+                if on_tick:
+                    on_tick(n)
 
     override = load_guid_override(root)
     if override:
