@@ -682,14 +682,19 @@ def animator(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict
         out["hint"] = "图谱缺 animator_states 表,请重新 build"
         return out
     guid = node["guid"]
+    st_cols = _cols(conn, "animator_states")
+    lyr = "layer" if "layer" in st_cols else "'' AS layer"
+    dft = "is_default" if "is_default" in st_cols else "0 AS is_default"
     rows = conn.execute(
-        "SELECT state_fileid, name, motion_guid FROM animator_states WHERE src_guid=?",
-        (guid,)).fetchall()
+        f"SELECT state_fileid, name, motion_guid, {lyr}, {dft}"
+        " FROM animator_states WHERE src_guid=?", (guid,)).fetchall()
     trans = conn.execute(
         "SELECT from_fileid, to_fileid, conditions FROM animator_transitions"
         " WHERE src_guid=?", (guid,)).fetchall()
     name_by_fid = {r["state_fileid"]: r["name"] for r in rows}
-    states = [{"state": r["name"], "motion": _asset_path(conn, r["motion_guid"])}
+    states = [{"state": r["name"], "layer": r["layer"],
+               "default": bool(r["is_default"]),
+               "motion": _asset_path(conn, r["motion_guid"])}
               for r in rows]
     transitions = []
     for t in trans:
@@ -705,7 +710,8 @@ def animator(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict
     cap = _cap(states, limit)
     out["states"] = cap["items"]
     out["transitions"] = transitions[:limit]
-    out["summary"] = {"states": len(states), "transitions": len(transitions)}
+    out["summary"] = {"states": len(states), "transitions": len(transitions),
+                      "layers": len({s["layer"] for s in states if s["layer"]})}
     if cap["truncated"]:
         out["summary"]["truncated"] = cap["truncated"]
     conn.close()
@@ -730,31 +736,45 @@ def timeline(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict
         out["hint"] = "图谱缺 timeline_tracks 表,请重新 build"
         return out
     guid = node["guid"]
+    tk_cols = _cols(conn, "timeline_tracks")
+    par = "parent_fileid" if "parent_fileid" in tk_cols else "'' AS parent_fileid"
     tracks = conn.execute(
-        "SELECT track_fileid, track_type, display_name FROM timeline_tracks"
+        f"SELECT track_fileid, track_type, display_name, {par} FROM timeline_tracks"
         " WHERE src_guid=?", (guid,)).fetchall()
+    cl_cols = _cols(conn, "timeline_clips")
+    kind = "asset_kind" if "asset_kind" in cl_cols else "'' AS asset_kind"
 
     def track_type(script_guid: str) -> str:
         p = _asset_path(conn, script_guid)
         return os.path.basename(p) if p else script_guid
 
+    name_by_fid = {tk["track_fileid"]: (tk["display_name"]
+                                        or track_type(tk["track_type"]))
+                   for tk in tracks}
     result = []
     clip_total = 0
     for tk in tracks:
         clips = conn.execute(
-            "SELECT clip_fileid, start, duration, display_name, asset_guid"
-            " FROM timeline_clips WHERE src_guid=? AND track_fileid=? ORDER BY start",
-            (guid, tk["track_fileid"])).fetchall()
+            "SELECT clip_fileid, start, duration, display_name, asset_guid,"
+            f" {kind} FROM timeline_clips WHERE src_guid=? AND track_fileid=?"
+            " ORDER BY start", (guid, tk["track_fileid"])).fetchall()
         clip_total += len(clips)
-        result.append({
+        row = {
             "track": tk["display_name"] or track_type(tk["track_type"]),
             "track_type": track_type(tk["track_type"]),
             "clips": [{"clip": c["display_name"],
                        "start": round(c["start"], 3),
                        "duration": round(c["duration"], 3),
-                       "asset": _asset_path(conn, c["asset_guid"])}
+                       # 外部资产为空是常态(录制动画内联在 .playable 里),
+                       # 这时 kind 说明这条 clip 播的是什么类型的 playable asset
+                       "asset": _asset_path(conn, c["asset_guid"]),
+                       "kind": track_type(c["asset_kind"])}
                       for c in clips[:limit]],
-        })
+        }
+        parent = name_by_fid.get(tk["parent_fileid"], "")
+        if parent:
+            row["parent"] = parent
+        result.append(row)
     cap = _cap(result, limit)
     out["tracks"] = cap["items"]
     out["summary"] = {"tracks": len(tracks), "clips": clip_total}
@@ -776,6 +796,11 @@ def _has_table(conn, name: str) -> bool:
     return bool(conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
         (name,)).fetchone())
+
+
+def _cols(conn, table: str) -> set:
+    """表的列名集合。老库缺新列时查询降级成空值,而不是抛 SQL 错。"""
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def dead_code(project_root: str, include_external: bool = False,

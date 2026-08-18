@@ -447,6 +447,22 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 
 ## Changelog
 
+### 0.7.2
+
+Timeline / Animator 资产录入补全(视觉资产扩展 Phase 1 收口,详见
+`docs/visual_assets_extension.md`):
+
+- **Animator 分层 + 默认态**:`animator_states` 加 `layer` / `is_default`,子状态机写成
+  `层名/子机名` 路径;`animator_transitions` 加 `layer`,AnyState 转移 from 为空。
+- **Timeline 轨道嵌套**:GroupTrack 的 `m_Children` 还原成 `parent_fileid`
+  (实测 `Gacha_tenTimeline` 52 轨中 41 轨有父轨),`unity_timeline` 输出 `parent`。
+- **clip 类型**:`timeline_clips.asset_kind` 记 PlayableAsset 的脚本 guid。实测 318 个 clip
+  里 277 个播的是内联录制动画(没有外部 guid),只有这一列能说明这条 clip 是什么。
+- **非 ASCII 名字解码**:Unity 把中文名写成 `"骨架|Idle"`,入库前解码(真实项目 11 行受影响)。
+- **修增量更新丢数据**:`update_files` 以前既不重解析 `.controller`/`.playable` 的文件内结构,
+  也不删旧行 —— 改过的动画资产会留脏行或整段丢失。已修 + 回归测试覆盖。
+- 老库自动 `ALTER TABLE` 补上述 5 列,不需要全量重建。
+
 ### 0.7.1
 
 全量 `build` 的用户体验:中型项目从 0 建图要数分钟,以前中途零输出,看起来像卡住。

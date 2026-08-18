@@ -71,7 +71,7 @@ def test_build():
     stats = graph.build(FIXTURE)
     check("脚本数", stats["scripts"] == 10, str(stats))
     check("类型数", stats["types"] == 13, str(stats))
-    check("YAML 资产数", stats["yaml_assets"] == 5, str(stats))
+    check("YAML 资产数", stats["yaml_assets"] == 6, str(stats))
     check("序列化引用数>=5", stats["refs"] >= 5, str(stats))
     check("资产数>=9", stats["assets"] >= 9, str(stats))
     check("UnityEvent 绑定==1", stats["events"] == 1, str(stats))
@@ -744,11 +744,38 @@ def test_visual_assets():
 --- !u!91 &9100000
 AnimatorController:
   m_Name: Demo
+  m_AnimatorLayers:
+  - serializedVersion: 5
+    m_Name: Base Layer
+    m_StateMachine: {fileID: -1001}
+    m_Mask: {fileID: 0}
 --- !u!1107 &-1001
 AnimatorStateMachine:
   m_Name: Base Layer
+  m_ChildStates:
+  - serializedVersion: 1
+    m_State: {fileID: -1101}
+    m_Position: {x: 0, y: 0, z: 0}
+  - serializedVersion: 1
+    m_State: {fileID: -1102}
+    m_Position: {x: 0, y: 0, z: 0}
+  m_ChildStateMachines:
+  - serializedVersion: 1
+    m_StateMachine: {fileID: -1108}
+    m_Position: {x: 0, y: 0, z: 0}
   m_AnyStateTransitions:
   - {fileID: -3002}
+  m_DefaultState: {fileID: -1101}
+--- !u!1107 &-1108
+AnimatorStateMachine:
+  m_Name: "\\u5B50\\u673A"
+  m_ChildStates:
+  - serializedVersion: 1
+    m_State: {fileID: -1103}
+    m_Position: {x: 0, y: 0, z: 0}
+  m_ChildStateMachines: []
+  m_AnyStateTransitions: []
+  m_DefaultState: {fileID: -1103}
 --- !u!1102 &-1101
 AnimatorState:
   m_Name: Idle
@@ -758,6 +785,10 @@ AnimatorState:
 --- !u!1102 &-1102
 AnimatorState:
   m_Name: Run
+  m_Transitions: []
+--- !u!1102 &-1103
+AnimatorState:
+  m_Name: "\\u9AA8\\u67B6|Open"
   m_Transitions: []
 --- !u!1101 &-3001
 AnimatorStateTransition:
@@ -773,8 +804,19 @@ AnimatorStateTransition:
 """
     a = va.parse_animator(controller)
     names = {s["name"] for s in a["states"]}
+    by_name = {s["name"]: s for s in a["states"]}
     check("controller 名", a["name"] == "Demo", str(a["name"]))
-    check("状态齐全", names == {"Idle", "Run"}, str(names))
+    check("状态齐全", names == {"Idle", "Run", "骨架|Open"}, str(names))
+    check("非 ASCII 名字解掉 \\uXXXX 转义", "骨架|Open" in names, str(names))
+    check("层名抽到", [l["name"] for l in a["layers"]] == ["Base Layer"],
+          str(a["layers"]))
+    check("state 归到所在层", by_name["Idle"]["layer"] == "Base Layer",
+          str(by_name["Idle"]))
+    check("子状态机的 state 层路径带子机名",
+          by_name["骨架|Open"]["layer"] == "Base Layer/子机",
+          str(by_name["骨架|Open"]))
+    check("默认状态标出来", by_name["Idle"]["is_default"] is True
+          and by_name["Run"]["is_default"] is False, str(a["states"]))
     check("负 fileID 的 motion guid 抽到",
           [s["motion_guid"] for s in a["states"] if s["name"] == "Idle"]
           == ["aa000000000000000000000000000001"], str(a["states"]))
@@ -783,6 +825,7 @@ AnimatorStateTransition:
           str(a["transitions"]))
     check("state 转移指向目标 state 的 fileID",
           by_from["-1101"]["to"] == "-1102", str(by_from))
+    check("转移带层信息", by_from["-1101"]["layer"] == "Base Layer", str(by_from))
     check("条件抽出参数名/模式/阈值",
           by_from["-1101"]["conditions"] == [
               {"event": "Speed", "mode": "6", "threshold": "1.5"}],
@@ -809,10 +852,32 @@ MonoBehaviour:
 MonoBehaviour:
   m_Script: {fileID: 11500000, guid: bb000000000000000000000000000002, type: 3}
   m_Clip: {fileID: 7400000, guid: cc000000000000000000000000000003, type: 2}
+--- !u!114 &-5003
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: bb000000000000000000000000000009, type: 3}
+  m_Name: GroupTrack
+  m_Children:
+  - {fileID: -5001}
+  m_Clips: []
+--- !u!114 &-5004
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: bb000000000000000000000000000001, type: 3}
+  m_Name: Recorded
+  m_Clips:
+  - m_Version: 1
+    m_Start: 0
+    m_Duration: 1
+    m_DisplayName: rec
+    m_Asset: {fileID: -5005}
+--- !u!114 &-5005
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: bb00000000000000000000000000000a, type: 3}
+  m_AnimationClip: {fileID: 7400001}
 """
     t = va.parse_timeline(playable)
-    check("轨道解析出 1 条", len(t["tracks"]) == 1, str(t))
-    tr = t["tracks"][0]
+    check("轨道解析出 3 条(含 GroupTrack)", len(t["tracks"]) == 3, str(len(t["tracks"])))
+    by_fid = {tk["fileid"]: tk for tk in t["tracks"]}
+    tr = by_fid["-5001"]
     check("轨道名/脚本 guid", tr["display_name"] == "MyTrack"
           and tr["script_guid"] == "bb000000000000000000000000000001", str(tr))
     check("clip 时序", [(c["start"], c["duration"], c["display_name"])
@@ -820,6 +885,48 @@ MonoBehaviour:
     check("clip 外部资产 guid 跳过 m_Script 只取内容引用",
           tr["clips"][0]["asset_guid"] == "cc000000000000000000000000000003",
           str(tr["clips"][0]))
+    check("GroupTrack 子轨道记到 parent_fileid",
+          tr["parent_fileid"] == "-5003" and by_fid["-5003"]["parent_fileid"] == "",
+          str([(x["fileid"], x["parent_fileid"]) for x in t["tracks"]]))
+    rec = by_fid["-5004"]["clips"][0]
+    check("内联(录制)clip 没外部 guid 也能靠 asset_kind 说明类型",
+          rec["asset_guid"] == ""
+          and rec["asset_kind"] == "bb00000000000000000000000000000a", str(rec))
+
+
+def test_visual_query_end_to_end():
+    print("[28] animator 查询 + 增量更新不留旧结构")
+    import shutil
+    import tempfile
+    rel = "Assets/Anim/Demo.controller"
+    r = queries.animator(FIXTURE, rel)
+    states = {s["state"]: s for s in r.get("states", [])}
+    check("建图后 animator 查得到状态", set(states) == {"Idle", "Run"}, str(r))
+    check("状态带层名", states.get("Idle", {}).get("layer") == "Base Layer",
+          str(states))
+    check("默认状态标记", states.get("Idle", {}).get("default") is True, str(states))
+    check("转移带条件",
+          r["transitions"] and r["transitions"][0]["conditions"]
+          == [{"event": "Speed", "mode": "3", "threshold": "0.1"}],
+          str(r.get("transitions")))
+
+    tmp = tempfile.mkdtemp(prefix="unity_llm_vis_")
+    try:
+        dst = os.path.join(tmp, "Proj")
+        shutil.copytree(FIXTURE, dst, ignore=shutil.ignore_patterns(".unity-llm"))
+        graph.build(dst)
+        p = os.path.join(dst, rel.replace("/", os.sep))
+        text = open(p, encoding="utf-8").read().replace("m_Name: Run",
+                                                        "m_Name: Walk")
+        open(p, "w", encoding="utf-8").write(text)
+        u = graph.update_files(dst, [rel])
+        check("增量更新 controller 无错误",
+              u["updated"] == [rel] and not u["errors"], str(u))
+        after = {s["state"] for s in queries.animator(dst, rel).get("states", [])}
+        check("增量更新后状态机是新的、没留旧状态",
+              after == {"Idle", "Walk"}, str(after))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -836,7 +943,8 @@ def main():
              test_guid_warning_precision, test_method_ref,
              test_parser_masking, test_partial_and_relay,
              test_correctness_hardening, test_atomic_build, test_hierarchy,
-             test_build_progress, test_visual_assets]
+             test_build_progress, test_visual_assets,
+             test_visual_query_end_to_end]
     failed = 0
     for t in tests:
         try:

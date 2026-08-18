@@ -144,19 +144,23 @@ CREATE TABLE IF NOT EXISTS animator_states (
     src_guid TEXT NOT NULL,       -- 所属 .controller 资产 guid
     state_fileid TEXT NOT NULL,   -- AnimatorState 的 fileID(字符串,可能为负)
     name TEXT NOT NULL DEFAULT '',
-    motion_guid TEXT NOT NULL DEFAULT ''  -- m_Motion 指向的 clip guid
+    motion_guid TEXT NOT NULL DEFAULT '',  -- m_Motion 指向的 clip guid
+    layer TEXT NOT NULL DEFAULT '',        -- 所属层(子状态机为 `层名/子机名`)
+    is_default INTEGER NOT NULL DEFAULT 0  -- 是否所在状态机的 m_DefaultState
 );
 CREATE TABLE IF NOT EXISTS animator_transitions (
     src_guid TEXT NOT NULL,
     from_fileid TEXT NOT NULL,    -- 源 state fileID
     to_fileid TEXT NOT NULL DEFAULT '',   -- m_DstState 的 fileID
-    conditions TEXT NOT NULL DEFAULT ''   -- JSON 数组 [{event,mode,threshold}]
+    conditions TEXT NOT NULL DEFAULT '',  -- JSON 数组 [{event,mode,threshold}]
+    layer TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS timeline_tracks (
     src_guid TEXT NOT NULL,       -- 所属 .playable 资产 guid
     track_fileid TEXT NOT NULL,
     track_type TEXT NOT NULL DEFAULT '',  -- m_Script guid(查询期 join 成脚本路径)
-    display_name TEXT NOT NULL DEFAULT ''
+    display_name TEXT NOT NULL DEFAULT '',
+    parent_fileid TEXT NOT NULL DEFAULT ''  -- GroupTrack 父轨道 fileID(空=顶层)
 );
 CREATE TABLE IF NOT EXISTS timeline_clips (
     src_guid TEXT NOT NULL,
@@ -165,7 +169,8 @@ CREATE TABLE IF NOT EXISTS timeline_clips (
     start REAL NOT NULL DEFAULT 0,
     duration REAL NOT NULL DEFAULT 0,
     display_name TEXT NOT NULL DEFAULT '',
-    asset_guid TEXT NOT NULL DEFAULT ''   -- clip 引用的外部资产(AnimationClip 等)
+    asset_guid TEXT NOT NULL DEFAULT '',  -- clip 引用的外部资产(AnimationClip 等)
+    asset_kind TEXT NOT NULL DEFAULT ''   -- playable asset 的脚本 guid(内联 clip 靠它判类型)
 );
 CREATE TABLE IF NOT EXISTS visual_refs (
     src_guid TEXT NOT NULL,
@@ -529,31 +534,34 @@ def _insert_visual_structure(cur, text: str, rel: str, guid: str) -> dict:
             for s in a["states"]:
                 cur.execute(
                     "INSERT INTO animator_states(src_guid, state_fileid, name,"
-                    " motion_guid) VALUES (?,?,?,?)",
-                    (guid, s["fileid"], s["name"], s["motion_guid"]))
+                    " motion_guid, layer, is_default) VALUES (?,?,?,?,?,?)",
+                    (guid, s["fileid"], s["name"], s["motion_guid"],
+                     s.get("layer", ""), int(s.get("is_default", False))))
                 n["states"] += 1
             for t in a["transitions"]:
                 cur.execute(
                     "INSERT INTO animator_transitions(src_guid, from_fileid,"
-                    " to_fileid, conditions) VALUES (?,?,?,?)",
+                    " to_fileid, conditions, layer) VALUES (?,?,?,?,?)",
                     (guid, t["from"], t["to"],
-                     json.dumps(t["conditions"], ensure_ascii=False)))
+                     json.dumps(t["conditions"], ensure_ascii=False),
+                     t.get("layer", "")))
                 n["transitions"] += 1
         elif ext == ".playable":
             tl = parse_timeline(text)
             for tk in tl["tracks"]:
                 cur.execute(
                     "INSERT INTO timeline_tracks(src_guid, track_fileid,"
-                    " track_type, display_name) VALUES (?,?,?,?)",
-                    (guid, tk["fileid"], tk["script_guid"], tk["display_name"]))
+                    " track_type, display_name, parent_fileid) VALUES (?,?,?,?,?)",
+                    (guid, tk["fileid"], tk["script_guid"], tk["display_name"],
+                     tk.get("parent_fileid", "")))
                 n["tracks"] += 1
                 for c in tk["clips"]:
                     cur.execute(
                         "INSERT INTO timeline_clips(src_guid, track_fileid,"
-                        " clip_fileid, start, duration, display_name, asset_guid)"
-                        " VALUES (?,?,?,?,?,?,?)",
+                        " clip_fileid, start, duration, display_name, asset_guid,"
+                        " asset_kind) VALUES (?,?,?,?,?,?,?,?)",
                         (guid, tk["fileid"], c["fileid"], c["start"], c["duration"],
-                         c["display_name"], c["asset_guid"]))
+                         c["display_name"], c["asset_guid"], c.get("asset_kind", "")))
                     n["clips"] += 1
         elif ext == ".shadergraph":
             for sub in parse_shadergraph(text)["subgraphs"]:
@@ -569,8 +577,8 @@ def _insert_visual_structure(cur, text: str, rel: str, guid: str) -> dict:
                     " VALUES (?,?,?,?)",
                     (guid, "vfx_ref", "", r["guid"]))
                 n["visual_refs"] += 1
-    except Exception:
-        pass
+    except Exception as e:
+        n["error"] = str(e)
     return n
 
 
@@ -830,6 +838,15 @@ def update_files(project_root: str, rel_paths) -> dict:
         raise RuntimeError(
             "graph.db 是旧版本 schema(缺 members.code_used),"
             "增量更新不可用。先跑一次 unity-llm build 全量重建。")
+    # 视觉结构表 0.7.2 加了列;CREATE TABLE IF NOT EXISTS 不会补,老库要显式 ALTER
+    for table, col, decl in (("animator_states", "layer", "TEXT NOT NULL DEFAULT ''"),
+                             ("animator_states", "is_default", "INTEGER NOT NULL DEFAULT 0"),
+                             ("animator_transitions", "layer", "TEXT NOT NULL DEFAULT ''"),
+                             ("timeline_tracks", "parent_fileid", "TEXT NOT NULL DEFAULT ''"),
+                             ("timeline_clips", "asset_kind", "TEXT NOT NULL DEFAULT ''")):
+        have = {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}
+        if have and col not in have:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     out = {"updated": [], "deleted": [], "errors": []}
 
     for rel in rel_paths:
@@ -852,6 +869,12 @@ def update_files(project_root: str, rel_paths) -> dict:
         if old_asset:
             cur.execute("DELETE FROM objects WHERE src_guid=?",
                         (old_asset["guid"],))
+            # 视觉结构(状态机/轨道/clip)也按 guid 清,不然改过的 controller/playable
+            # 会留下旧状态 + 新状态两份
+            for table in ("animator_states", "animator_transitions",
+                          "timeline_tracks", "timeline_clips", "visual_refs"):
+                cur.execute(f"DELETE FROM {table} WHERE src_guid=?",
+                            (old_asset["guid"],))
         cur.execute("DELETE FROM assets WHERE path=?", (rel,))
         if not os.path.exists(abspath):
             if old_asset:
@@ -877,6 +900,9 @@ def update_files(project_root: str, rel_paths) -> dict:
                 _insert_csharp(cur, text, rel, guid, int(is_external(rel, root)))
             elif ext in YAML_ASSET_EXTS:
                 _insert_yaml(cur, text, rel, guid)
+                _insert_visual_structure(cur, text, rel, guid)
+            elif ext in JSON_ASSET_EXTS:
+                _insert_visual_structure(cur, text, rel, guid)
             out["updated"].append(rel)
         except Exception as e:
             out["errors"].append({"file": rel, "error": str(e)})

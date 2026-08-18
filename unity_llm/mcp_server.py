@@ -181,8 +181,8 @@ TOOLS = [
     },
     {
         "name": "unity_animator",
-        "description": ("AnimatorController 状态机结构:状态列表(名 + 目标 clip)、"
-                        "状态转移(源/目标 + 条件参数)。这是文件内 fileID 结构,"
+        "description": ("AnimatorController 状态机结构:分层的状态列表(层名 + 默认态 + 目标 clip)、"
+                        "状态转移(源/目标 + 条件参数 + 所在层)。这是文件内 fileID 结构,"
                         "grep/代码图谱都看不见,改动画状态机前先用它看全貌。"),
         "inputSchema": {
             "type": "object",
@@ -195,9 +195,9 @@ TOOLS = [
     },
     {
         "name": "unity_timeline",
-        "description": ("Timeline(.playable)轨道结构:track 列表(类型/名)+ 每条 track 的 "
-                        "clip(时序 start/duration + 引用的外部资产)。改演出前先用它看结构,"
-                        "别靠 Editor MCP execute_code 去列轨道。"),
+        "description": ("Timeline(.playable)轨道结构:track 列表(类型/名/GroupTrack 父子嵌套)+ "
+                        "每条 track 的 clip(时序 start/duration + clip 类型 + 引用的外部资产)。"
+                        "改演出前先用它看结构,别靠 Editor MCP execute_code 去列轨道。"),
         "inputSchema": {
             "type": "object",
             "properties": {

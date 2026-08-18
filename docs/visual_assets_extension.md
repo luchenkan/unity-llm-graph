@@ -105,6 +105,21 @@
 - 新查询命令：`components --target xxx.controller` 输出层级化状态机；`timeline --target xxx.playable` 输出轨道树。
 - 这一步做完，LLM 就能回答：「这个 Animator 有哪些状态、怎么切换、每个状态播哪个 clip」「这个 Timeline 有哪几条 track、每条绑了谁、clip 在什么时间段」。
 
+**Phase 1 状态：已完成（0.7.2）**，落在 `unity_llm/visual_assets.py` + `graph.py` 建表 + `queries.animator/timeline`
+（CLI `animator` / `timeline`，MCP `unity_animator` / `unity_timeline`）。实际入库的东西：
+
+| 维度 | 入库内容 | 表/列 |
+|---|---|---|
+| Animator 层 | 每个 layer 名，state 属于哪层，子状态机写成 `层名/子机名` 路径 | `animator_states.layer` |
+| Animator 默认态 | layer / 子状态机的 `m_DefaultState` | `animator_states.is_default` |
+| Animator 转移 | from/to + 条件（参数名、`m_ConditionMode`、阈值）+ 所在层；AnyState 转移 from 为空 | `animator_transitions.layer` |
+| Timeline 轨道嵌套 | GroupTrack 的 `m_Children` 还原成父子（实测 `Gacha_tenTimeline` 52 轨里 41 轨有父） | `timeline_tracks.parent_fileid` |
+| Timeline clip 类型 | clip 的 PlayableAsset 的 `m_Script` guid，用来区分 Animation/Control/Activation clip。**关键**：实测 318 个 clip 里 277 个播的是内联录制动画（没有外部 guid），只有这一列能说明它是什么 | `timeline_clips.asset_kind` |
+| 名字可读性 | Unity 把非 ASCII 名写成 `"骨架|Idle"`，入库前解码（实测真实项目 11 行受影响） | 全部 name 列 |
+| 增量刷新 | `update_files` 之前既不重解析视觉结构、也不删旧行 → `.controller`/`.playable` 增量更新会丢数据或留脏行。已修 + 回归测试覆盖 | `graph.update_files` |
+
+老库自动 `ALTER TABLE` 补这 5 列，不用重建。
+
 ### Phase 2：ShaderGraph / VFX（JSON 解析）——次优先
 
 - 新增 JSON 分支：`.shadergraph` / `.vfx` 用 `json.loads`（Unity 这两个都是 JSON）。
@@ -125,10 +140,15 @@
 
 ## 五、风险 / 待验证
 
-- [ ] Timeline 的 `m_Binding` 到底存的是 fileID 还是 path，不同 Unity 版本有差异（本文件已见 clip 内 `path:` 字段）。
-- [ ] Animator `m_Conditions` 的比较符枚举（`m_ConditionMode`）数值 → 语义映射要查 Unity 源码。
-- [ ] 团结引擎（`%TAG !u! tag:yousandi.cn,2023`）的 fileID 是负数（如 `&-2764362647030779139`），
-      解析时要按**字符串**处理 fileID，不能当普通 int 排序。
+- [x] 团结引擎（`%TAG !u! tag:yousandi.cn,2023`）的 fileID 是负数（如 `&-2764362647030779139`），
+      解析时按**字符串**处理 fileID。已按字符串实现 + fixture 覆盖负 fileID。
+- [x] Animator `m_Conditions` 的 `m_ConditionMode` 原样入库（数值 + 参数名 + 阈值），不做语义映射：
+      Unity 各版本枚举值不保证一致，映射错比不映射更坏。
+- [ ] Timeline 的 `m_Binding` / PlayableDirector 的场景绑定**仍未捕获** —— 现在能说出「有哪几条 track、
+      clip 在什么时间段、播的是什么类型」，但说不出「这条 track 绑的是场景里哪个物体」。是 Phase 1 的已知缺口。
+- [ ] `parse_shadergraph` 在真实项目 294 个 `.shadergraph` 上**产出 0 行**：真实 ShaderGraph JSON 用
+      `m_ObjectId` 引用块，不是设计时假设的 `m_SubGraphs`。Phase 2 要按真实格式重写。
+- [ ] `.vfx` 解析**未验证**（本项目 0 个资产）。
 - [ ] 写侧 Timeline 需要 Unity 编辑器里真机验证（`TimelineAsset` API 的 `CreateClip` 签名在 Unity 6 是否有变）。
 
 ---
