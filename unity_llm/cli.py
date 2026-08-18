@@ -66,6 +66,16 @@ def cmd_components(args) -> int:
     return 0
 
 
+def cmd_animator(args) -> int:
+    _print(args, queries.animator(_project(args), args.target, limit=args.limit))
+    return 0
+
+
+def cmd_timeline(args) -> int:
+    _print(args, queries.timeline(_project(args), args.target, limit=args.limit))
+    return 0
+
+
 def cmd_find(args) -> int:
     _print(args, queries.find_symbols(_project(args), args.pattern,
                                       limit=args.limit, kind=args.kind))
@@ -206,6 +216,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_external(sp)
     add_limit(sp)
     sp.set_defaults(func=cmd_components)
+
+    sp = sub.add_parser("animator",
+                        help="AnimatorController 状态机结构:状态 + 转移 + 目标 clip")
+    add_project(sp)
+    sp.add_argument("--target", required=True)
+    add_limit(sp)
+    sp.set_defaults(func=cmd_animator)
+
+    sp = sub.add_parser("timeline",
+                        help="Timeline 轨道结构:track + clip 时序 + 引用资产")
+    add_project(sp)
+    sp.add_argument("--target", required=True)
+    add_limit(sp)
+    sp.set_defaults(func=cmd_timeline)
 
     sp = sub.add_parser("find", help="按名字模糊搜索类型/成员/资产")
     add_project(sp)

@@ -655,6 +655,115 @@ def components(project_root: str, target: str,
     return out
 
 
+# ------------------------------------------------------------ visual assets
+
+def _asset_path(conn, guid: str) -> str:
+    if not guid:
+        return ""
+    r = conn.execute("SELECT path FROM assets WHERE guid=?", (guid,)).fetchone()
+    return r["path"] if r else guid
+
+
+def animator(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict:
+    """AnimatorController 结构:状态列表(名 + 目标 clip)+ 状态转移(含条件)。"""
+    conn = connect(project_root)
+    node = resolve_target(conn, target)
+    out: Dict = {"target": target, "resolved": _present_node(node)}
+    if node["kind"] != "asset":
+        conn.close()
+        out["hint"] = _unresolved_hint(node)
+        return out
+    if node.get("ext") != ".controller":
+        conn.close()
+        out["hint"] = f"目标是 {node.get('ext') or '?'},不是 .controller"
+        return out
+    if not _has_table(conn, "animator_states"):
+        conn.close()
+        out["hint"] = "图谱缺 animator_states 表,请重新 build"
+        return out
+    guid = node["guid"]
+    rows = conn.execute(
+        "SELECT state_fileid, name, motion_guid FROM animator_states WHERE src_guid=?",
+        (guid,)).fetchall()
+    trans = conn.execute(
+        "SELECT from_fileid, to_fileid, conditions FROM animator_transitions"
+        " WHERE src_guid=?", (guid,)).fetchall()
+    name_by_fid = {r["state_fileid"]: r["name"] for r in rows}
+    states = [{"state": r["name"], "motion": _asset_path(conn, r["motion_guid"])}
+              for r in rows]
+    transitions = []
+    for t in trans:
+        try:
+            conds = json.loads(t["conditions"]) if t["conditions"] else []
+        except (json.JSONDecodeError, ValueError):
+            conds = []
+        transitions.append({
+            "from": name_by_fid.get(t["from_fileid"], t["from_fileid"]),
+            "to": name_by_fid.get(t["to_fileid"], t["to_fileid"]),
+            "conditions": conds,
+        })
+    cap = _cap(states, limit)
+    out["states"] = cap["items"]
+    out["transitions"] = transitions[:limit]
+    out["summary"] = {"states": len(states), "transitions": len(transitions)}
+    if cap["truncated"]:
+        out["summary"]["truncated"] = cap["truncated"]
+    conn.close()
+    return out
+
+
+def timeline(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict:
+    """Timeline 结构:轨道列表 + 每条轨道的 clip(时序 + 引用的外部资产)。"""
+    conn = connect(project_root)
+    node = resolve_target(conn, target)
+    out: Dict = {"target": target, "resolved": _present_node(node)}
+    if node["kind"] != "asset":
+        conn.close()
+        out["hint"] = _unresolved_hint(node)
+        return out
+    if node.get("ext") != ".playable":
+        conn.close()
+        out["hint"] = f"目标是 {node.get('ext') or '?'},不是 .playable"
+        return out
+    if not _has_table(conn, "timeline_tracks"):
+        conn.close()
+        out["hint"] = "图谱缺 timeline_tracks 表,请重新 build"
+        return out
+    guid = node["guid"]
+    tracks = conn.execute(
+        "SELECT track_fileid, track_type, display_name FROM timeline_tracks"
+        " WHERE src_guid=?", (guid,)).fetchall()
+
+    def track_type(script_guid: str) -> str:
+        p = _asset_path(conn, script_guid)
+        return os.path.basename(p) if p else script_guid
+
+    result = []
+    clip_total = 0
+    for tk in tracks:
+        clips = conn.execute(
+            "SELECT clip_fileid, start, duration, display_name, asset_guid"
+            " FROM timeline_clips WHERE src_guid=? AND track_fileid=? ORDER BY start",
+            (guid, tk["track_fileid"])).fetchall()
+        clip_total += len(clips)
+        result.append({
+            "track": tk["display_name"] or track_type(tk["track_type"]),
+            "track_type": track_type(tk["track_type"]),
+            "clips": [{"clip": c["display_name"],
+                       "start": round(c["start"], 3),
+                       "duration": round(c["duration"], 3),
+                       "asset": _asset_path(conn, c["asset_guid"])}
+                      for c in clips[:limit]],
+        })
+    cap = _cap(result, limit)
+    out["tracks"] = cap["items"]
+    out["summary"] = {"tracks": len(tracks), "clips": clip_total}
+    if cap["truncated"]:
+        out["summary"]["truncated"] = cap["truncated"]
+    conn.close()
+    return out
+
+
 # ---------------------------------------------------------------- dead code
 
 def _dir_bucket(path: str, segs: int = 3) -> str:

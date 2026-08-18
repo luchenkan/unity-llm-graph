@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -32,6 +33,8 @@ from .meta import (GUID_MAP_FILE, HEX_GUID_RE, PROJECT_VERSION_FILE,
                    _guid_of_meta, build_guid_map, detect_engine,
                    guid_format_report, iter_assets, is_external)
 from .unity_yaml import parse_unity_yaml
+from .visual_assets import (parse_animator, parse_timeline,
+                            parse_shadergraph, parse_vfx)
 from .csharp import parse_csharp, short_type
 
 DB_DIR = ".unity-llm"
@@ -40,6 +43,8 @@ DB_NAME = "graph.db"
 SCRIPT_EXTS = {".cs"}
 YAML_ASSET_EXTS = {".prefab", ".unity", ".asset", ".controller", ".anim",
                    ".mat", ".physicMaterial", ".playable", ".mask", ".preset"}
+# JSON 序列化的视觉资产(走 visual_assets 的 JSON 分支,不吃 YAML parser)
+JSON_ASSET_EXTS = {".shadergraph", ".vfx"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta_kv (key TEXT PRIMARY KEY, value TEXT);
@@ -135,6 +140,39 @@ CREATE TABLE IF NOT EXISTS objects (
     father_fileid INTEGER NOT NULL DEFAULT -1, -- Transform 的父 Transform fileID(0=根,-1=非 Transform)
     script_guid TEXT NOT NULL DEFAULT ''  -- MonoBehaviour 的 m_Script guid
 );
+CREATE TABLE IF NOT EXISTS animator_states (
+    src_guid TEXT NOT NULL,       -- 所属 .controller 资产 guid
+    state_fileid TEXT NOT NULL,   -- AnimatorState 的 fileID(字符串,可能为负)
+    name TEXT NOT NULL DEFAULT '',
+    motion_guid TEXT NOT NULL DEFAULT ''  -- m_Motion 指向的 clip guid
+);
+CREATE TABLE IF NOT EXISTS animator_transitions (
+    src_guid TEXT NOT NULL,
+    from_fileid TEXT NOT NULL,    -- 源 state fileID
+    to_fileid TEXT NOT NULL DEFAULT '',   -- m_DstState 的 fileID
+    conditions TEXT NOT NULL DEFAULT ''   -- JSON 数组 [{event,mode,threshold}]
+);
+CREATE TABLE IF NOT EXISTS timeline_tracks (
+    src_guid TEXT NOT NULL,       -- 所属 .playable 资产 guid
+    track_fileid TEXT NOT NULL,
+    track_type TEXT NOT NULL DEFAULT '',  -- m_Script guid(查询期 join 成脚本路径)
+    display_name TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS timeline_clips (
+    src_guid TEXT NOT NULL,
+    track_fileid TEXT NOT NULL,
+    clip_fileid TEXT NOT NULL,
+    start REAL NOT NULL DEFAULT 0,
+    duration REAL NOT NULL DEFAULT 0,
+    display_name TEXT NOT NULL DEFAULT '',
+    asset_guid TEXT NOT NULL DEFAULT ''   -- clip 引用的外部资产(AnimationClip 等)
+);
+CREATE TABLE IF NOT EXISTS visual_refs (
+    src_guid TEXT NOT NULL,
+    kind TEXT NOT NULL,           -- subgraph / vfx_ref
+    name TEXT NOT NULL DEFAULT '',
+    dst_guid TEXT NOT NULL DEFAULT ''
+);
 """
 
 INDEX_SCHEMA = """
@@ -152,6 +190,9 @@ CREATE INDEX IF NOT EXISTS idx_events_method ON events(method);
 CREATE INDEX IF NOT EXISTS idx_deleted_path ON deleted_assets(path);
 CREATE INDEX IF NOT EXISTS idx_objects_src ON objects(src_guid);
 CREATE INDEX IF NOT EXISTS idx_objects_go ON objects(src_guid, go_fileid);
+CREATE INDEX IF NOT EXISTS idx_animator_states_src ON animator_states(src_guid);
+CREATE INDEX IF NOT EXISTS idx_timeline_tracks_src ON timeline_tracks(src_guid);
+CREATE INDEX IF NOT EXISTS idx_timeline_clips_track ON timeline_clips(track_fileid);
 """
 
 # 同名方法在超过这么多类型里出现,就算「热名字」:接收者类型未知时
@@ -475,6 +516,64 @@ def _insert_yaml(cur, text: str, rel: str, guid: str) -> dict:
     return n
 
 
+def _insert_visual_structure(cur, text: str, rel: str, guid: str) -> dict:
+    """解析并写入视觉资产的内部结构(状态机/轨道/clip 时序/subgraph 引用)。
+
+    结构解析失败只吞掉异常、不影响主图 —— 这些是增量能力,不该拖垮建图。
+    """
+    n = {"states": 0, "transitions": 0, "tracks": 0, "clips": 0, "visual_refs": 0}
+    ext = _asset_ext(rel)
+    try:
+        if ext == ".controller":
+            a = parse_animator(text)
+            for s in a["states"]:
+                cur.execute(
+                    "INSERT INTO animator_states(src_guid, state_fileid, name,"
+                    " motion_guid) VALUES (?,?,?,?)",
+                    (guid, s["fileid"], s["name"], s["motion_guid"]))
+                n["states"] += 1
+            for t in a["transitions"]:
+                cur.execute(
+                    "INSERT INTO animator_transitions(src_guid, from_fileid,"
+                    " to_fileid, conditions) VALUES (?,?,?,?)",
+                    (guid, t["from"], t["to"],
+                     json.dumps(t["conditions"], ensure_ascii=False)))
+                n["transitions"] += 1
+        elif ext == ".playable":
+            tl = parse_timeline(text)
+            for tk in tl["tracks"]:
+                cur.execute(
+                    "INSERT INTO timeline_tracks(src_guid, track_fileid,"
+                    " track_type, display_name) VALUES (?,?,?,?)",
+                    (guid, tk["fileid"], tk["script_guid"], tk["display_name"]))
+                n["tracks"] += 1
+                for c in tk["clips"]:
+                    cur.execute(
+                        "INSERT INTO timeline_clips(src_guid, track_fileid,"
+                        " clip_fileid, start, duration, display_name, asset_guid)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (guid, tk["fileid"], c["fileid"], c["start"], c["duration"],
+                         c["display_name"], c["asset_guid"]))
+                    n["clips"] += 1
+        elif ext == ".shadergraph":
+            for sub in parse_shadergraph(text)["subgraphs"]:
+                cur.execute(
+                    "INSERT INTO visual_refs(src_guid, kind, name, dst_guid)"
+                    " VALUES (?,?,?,?)",
+                    (guid, "subgraph", sub["name"], sub["guid"]))
+                n["visual_refs"] += 1
+        elif ext == ".vfx":
+            for r in parse_vfx(text)["refs"]:
+                cur.execute(
+                    "INSERT INTO visual_refs(src_guid, kind, name, dst_guid)"
+                    " VALUES (?,?,?,?)",
+                    (guid, "vfx_ref", "", r["guid"]))
+                n["visual_refs"] += 1
+    except Exception:
+        pass
+    return n
+
+
 def _propagate_mono(cur) -> int:
     """沿基类链把 is_mono 传给 ShopPage : BasePage : GameBehaviour : MonoBehaviour。
 
@@ -498,6 +597,32 @@ def _propagate_mono(cur) -> int:
                 changed = True
                 marked += 1
     return marked
+
+
+def _swap_db(building_path: str, final_path: str) -> None:
+    """把新库换上去。
+
+    Windows 上如果别的进程(常见是还在跑的 MCP server)开着 graph.db,rename 会
+    `PermissionError: [WinError 5]`,几分钟的 build 白跑。退路是用 sqlite 的备份 API
+    把新库内容原地灌进旧文件 —— 旧句柄仍然有效,读者下次查询就看到新数据。
+    """
+    try:
+        os.replace(building_path, final_path)
+        return
+    except OSError:
+        pass
+    src = sqlite3.connect(building_path)
+    dst = sqlite3.connect(final_path, timeout=30)
+    try:
+        src.backup(dst)
+        dst.commit()
+    finally:
+        src.close()
+        dst.close()
+    try:
+        os.remove(building_path)
+    except OSError:
+        pass
 
 
 def build(project_root: str, verbose: bool = False,
@@ -627,7 +752,9 @@ def build(project_root: str, verbose: bool = False,
         guid = path_to_guid.get(rel, "")
         try:
             with open(abspath, "r", encoding="utf-8", errors="replace") as f:
-                n = _insert_yaml(cur, f.read(), rel, guid)
+                text = f.read()
+            n = _insert_yaml(cur, text, rel, guid)
+            _insert_visual_structure(cur, text, rel, guid)
         except Exception:
             stats["errors"] += 1
             continue
@@ -636,6 +763,19 @@ def build(project_root: str, verbose: bool = False,
         stats["events"] += n["events"]
         prog.maybe(stats["yaml_assets"], yaml_total, "[4/6] YAML")
     prog.log(f"[4/6] YAML 完成 {stats['yaml_assets']} 资产")
+
+    # 3.5) 视觉资产 JSON(ShaderGraph / VFX)
+    for abspath, rel in iter_assets(root):
+        ext = _asset_ext(rel)
+        if ext not in JSON_ASSET_EXTS:
+            continue
+        guid = path_to_guid.get(rel, "")
+        try:
+            with open(abspath, "r", encoding="utf-8", errors="replace") as f:
+                _insert_visual_structure(cur, f.read(), rel, guid)
+        except Exception:
+            stats["errors"] += 1
+            continue
 
     # 4) 自定义 MB 基类链(BasePage : GameBehaviour : MonoBehaviour)
     prog.log("[5/6] 传播 MonoBehaviour 标记")
@@ -656,7 +796,7 @@ def build(project_root: str, verbose: bool = False,
     cur.executescript(INDEX_SCHEMA)
     conn.commit()
     conn.close()
-    os.replace(building_path, final_path)
+    _swap_db(building_path, final_path)
     stats["guid_source"] = guid_source
     stats["engine"] = engine["engine"]
     stats["engine_version"] = engine["version"]

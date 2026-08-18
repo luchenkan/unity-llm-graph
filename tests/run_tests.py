@@ -20,6 +20,7 @@
  17. method_ref 委托/方法组引用(Register(OnFoo) / evt += OnFoo)算被使用
  18. parser  注释/字符串同遍遮罩(URL 里的 // 不能吃掉后面的代码)
  19. build   verbose 进度写 stderr,默认安静
+ 20. visual  Animator/Timeline 结构解析(缩进列表 / AnyState / 负 fileID)
 """
 import base64
 import json
@@ -735,6 +736,92 @@ def test_build_progress():
     check("有完成行", "完成" in text, text[-400:])
 
 
+def test_visual_assets():
+    print("[27] 视觉资产结构解析")
+    from unity_llm import visual_assets as va
+    # 真实 Unity 输出:文档体内的 key 带 2 空格缩进,列表项内联;fileID 可以是负数
+    controller = """%YAML 1.1
+--- !u!91 &9100000
+AnimatorController:
+  m_Name: Demo
+--- !u!1107 &-1001
+AnimatorStateMachine:
+  m_Name: Base Layer
+  m_AnyStateTransitions:
+  - {fileID: -3002}
+--- !u!1102 &-1101
+AnimatorState:
+  m_Name: Idle
+  m_Motion: {fileID: 7400000, guid: aa000000000000000000000000000001, type: 2}
+  m_Transitions:
+  - {fileID: -3001}
+--- !u!1102 &-1102
+AnimatorState:
+  m_Name: Run
+  m_Transitions: []
+--- !u!1101 &-3001
+AnimatorStateTransition:
+  m_Conditions:
+  - m_ConditionMode: 6
+    m_ConditionEvent: Speed
+    m_EventTreshold: 1.5
+  m_DstState: {fileID: -1102}
+--- !u!1101 &-3002
+AnimatorStateTransition:
+  m_Conditions: []
+  m_DstState: {fileID: -1101}
+"""
+    a = va.parse_animator(controller)
+    names = {s["name"] for s in a["states"]}
+    check("controller 名", a["name"] == "Demo", str(a["name"]))
+    check("状态齐全", names == {"Idle", "Run"}, str(names))
+    check("负 fileID 的 motion guid 抽到",
+          [s["motion_guid"] for s in a["states"] if s["name"] == "Idle"]
+          == ["aa000000000000000000000000000001"], str(a["states"]))
+    by_from = {t["from"]: t for t in a["transitions"]}
+    check("缩进的 m_Transitions 能解析(不能是 0 条)", len(a["transitions"]) == 2,
+          str(a["transitions"]))
+    check("state 转移指向目标 state 的 fileID",
+          by_from["-1101"]["to"] == "-1102", str(by_from))
+    check("条件抽出参数名/模式/阈值",
+          by_from["-1101"]["conditions"] == [
+              {"event": "Speed", "mode": "6", "threshold": "1.5"}],
+          str(by_from["-1101"]))
+    check("AnyState 转移不丢(from 记 AnyState)",
+          "AnyState" in by_from and by_from["AnyState"]["to"] == "-1101",
+          str(by_from))
+
+    # Timeline:track 是 MonoBehaviour(114),clip 是内联对象,m_Asset 指向同文件内的 playable asset
+    playable = """%YAML 1.1
+--- !u!114 &-5001
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: bb000000000000000000000000000001, type: 3}
+  m_Name: MyTrack
+  m_Clips:
+  - m_Version: 1
+    m_Start: 1.5
+    m_Duration: 2.25
+    m_DisplayName: hit
+    m_Asset: {fileID: -5002}
+  m_Markers:
+    m_Objects: []
+--- !u!114 &-5002
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: bb000000000000000000000000000002, type: 3}
+  m_Clip: {fileID: 7400000, guid: cc000000000000000000000000000003, type: 2}
+"""
+    t = va.parse_timeline(playable)
+    check("轨道解析出 1 条", len(t["tracks"]) == 1, str(t))
+    tr = t["tracks"][0]
+    check("轨道名/脚本 guid", tr["display_name"] == "MyTrack"
+          and tr["script_guid"] == "bb000000000000000000000000000001", str(tr))
+    check("clip 时序", [(c["start"], c["duration"], c["display_name"])
+                      for c in tr["clips"]] == [(1.5, 2.25, "hit")], str(tr["clips"]))
+    check("clip 外部资产 guid 跳过 m_Script 只取内容引用",
+          tr["clips"][0]["asset_guid"] == "cc000000000000000000000000000003",
+          str(tr["clips"][0]))
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -749,7 +836,7 @@ def main():
              test_guid_warning_precision, test_method_ref,
              test_parser_masking, test_partial_and_relay,
              test_correctness_hardening, test_atomic_build, test_hierarchy,
-             test_build_progress]
+             test_build_progress, test_visual_assets]
     failed = 0
     for t in tests:
         try:
