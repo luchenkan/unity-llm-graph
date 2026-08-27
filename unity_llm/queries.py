@@ -14,7 +14,8 @@ import json
 import os
 from typing import Dict, List, Optional, Set
 
-from .graph import connect, has_graph, build_command as graph_build_command
+from .graph import (connect, has_graph, build_command as graph_build_command,
+                    check_stale)
 from .unity_yaml import CLASS_NAMES
 
 DEFAULT_LIMIT = 60
@@ -284,6 +285,32 @@ def _present_node(node: Dict) -> Dict:
     return {k: node[k] for k in keep if k in node}
 
 
+def _stale_field(conn, project_root: str, node: Dict) -> Optional[Dict]:
+    """查询目标的文件在建图后又变过?返回 stale 告警字段,新鲜就返回 None。
+
+    只校验目标直接命中的文件(不追传递闭包):一条查询的结论主要由
+    目标自身的新鲜度决定,抽查它性价比最高,也不会拖慢大查询。
+    """
+    paths: List[str] = []
+    if node.get("kind") == "asset":
+        paths = [node["path"]]
+    elif node.get("kind") == "type":
+        paths = list(node.get("files") or [])[:8]
+    elif node.get("kind") in ("method", "field"):
+        paths = [node["file"]] if node.get("file") else []
+    paths = [p for p in paths if p]
+    if not paths:
+        return None
+    stale = check_stale(conn, project_root, paths)
+    if not stale:
+        return None
+    return {
+        "warning": "目标文件在图谱收录后被改过(mtime 不一致),以下结论可能"
+                   "基于旧结构;先 unity_update 这几个文件再下判断",
+        "files": stale,
+    }
+
+
 def impact(project_root: str, target: str, depth: int = 3,
            include_low: bool = False, include_external: bool = False,
            limit: int = DEFAULT_LIMIT) -> Dict:
@@ -304,6 +331,9 @@ def impact(project_root: str, target: str, depth: int = 3,
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
+    stale = _stale_field(conn, project_root, node)
+    if stale:
+        out["graph_stale"] = stale
 
     owners, names, guids, short = _type_scope(conn, node)
     confs = GOOD_CONF + ("low",) if include_low else GOOD_CONF
@@ -459,6 +489,9 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
+    stale = _stale_field(conn, project_root, node)
+    if stale:
+        out["graph_stale"] = stale
     owners, names, guids, short = _type_scope(conn, node)
     confs = GOOD_CONF + ("low",) if include_low else GOOD_CONF
     conf_marks = ",".join("?" * len(confs))
@@ -604,6 +637,9 @@ def components(project_root: str, target: str,
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
+    stale = _stale_field(conn, project_root, node)
+    if stale:
+        out["graph_stale"] = stale
     if node["kind"] == "asset" and node["ext"] in (".prefab", ".unity"):
         rows = conn.execute(
             "SELECT DISTINCT r.dst_guid g, r.context ctx, a.path p FROM refs r"
@@ -681,6 +717,9 @@ def animator(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict
         conn.close()
         out["hint"] = "图谱缺 animator_states 表,请重新 build"
         return out
+    stale = _stale_field(conn, project_root, node)
+    if stale:
+        out["graph_stale"] = stale
     guid = node["guid"]
     st_cols = _cols(conn, "animator_states")
     lyr = "layer" if "layer" in st_cols else "'' AS layer"
@@ -735,6 +774,9 @@ def timeline(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict
         conn.close()
         out["hint"] = "图谱缺 timeline_tracks 表,请重新 build"
         return out
+    stale = _stale_field(conn, project_root, node)
+    if stale:
+        out["graph_stale"] = stale
     guid = node["guid"]
     tk_cols = _cols(conn, "timeline_tracks")
     par = "parent_fileid" if "parent_fileid" in tk_cols else "'' AS parent_fileid"
@@ -1071,6 +1113,156 @@ def stats(project_root: str) -> Dict:
         else:
             out["guid_note"] = bad["message"]
     conn.close()
+    return out
+
+
+def digest(project_root: str, files: List[str], limit: int = 12) -> Dict:
+    """一批变更文件的影响面摘要:pull / code review 后先看波及谁,再决定细查哪。
+
+    和逐个跑 impact 的区别:一次吃进整批文件(git diff 的输出),
+    聚合出「引用方最多的资产 / 调用最多的类型 / 挂载点」三张 top 榜,
+    而不是 N 份完整影响面 —— 面向人/模型快速判断「这次同步炸多大」。
+    """
+    conn = connect(project_root)
+    rels: List[str] = []
+    for f in files:
+        r = f.replace("\\", "/").strip().lstrip("/")
+        if r and r not in rels:
+            rels.append(r)
+    out: Dict = {"files_total": len(rels), "scripts": 0, "yaml_assets": 0,
+                 "other": 0, "unknown": [], "top_code_callers": [],
+                 "top_asset_dependents": [], "mounted_by": 0,
+                 "event_bindings": 0}
+    if not rels:
+        conn.close()
+        return out
+
+    guids: List[str] = []
+    script_rels: List[str] = []
+    for rel in rels:
+        row = conn.execute(
+            "SELECT guid, ext FROM assets WHERE path=?", (rel,)).fetchone()
+        if not row or not row["guid"]:
+            out["unknown"].append(rel)
+            continue
+        if row["ext"] == ".cs":
+            out["scripts"] += 1
+            script_rels.append(rel)
+            guids.append(row["guid"])
+        elif row["ext"] in (".prefab", ".unity", ".asset", ".controller",
+                            ".anim", ".playable", ".mask", ".preset",
+                            ".mat", ".shadergraph", ".vfx"):
+            out["yaml_assets"] += 1
+            guids.append(row["guid"])
+        else:
+            out["other"] += 1
+    out["unknown"] = out["unknown"][:8]
+
+    # 1) 脚本侧:这批文件里定义的类型,被哪些类型调用(聚合 top)
+    if script_rels:
+        marks = ",".join("?" * len(script_rels))
+        owners = [r["full_name"] for r in conn.execute(
+            f"SELECT DISTINCT full_name FROM types WHERE file IN ({marks})",
+            script_rels)]
+        if owners:
+            omarks = ",".join("?" * len(owners))
+            for r in conn.execute(
+                    "SELECT src_owner, count(*) c FROM calls WHERE resolved_owner"
+                    f" IN ({omarks}) AND confidence IN ('high','medium')"
+                    " GROUP BY src_owner ORDER BY c DESC LIMIT ?",
+                    owners + [limit]):
+                out["top_code_callers"].append({"caller": r["src_owner"],
+                                                "calls": r["c"]})
+        # 被多少 prefab/scene 挂载(挂载点变化= UI 结构变化,review 重点)
+        gmarks = ",".join("?" * len(guids))
+        out["mounted_by"] = conn.execute(
+            "SELECT count(DISTINCT src_guid) FROM objects WHERE script_guid"
+            f" IN ({gmarks})", guids).fetchone()[0]
+
+    # 2) 资产侧:引用了这批资产的资产(排除这批自身),聚合 top
+    if guids:
+        gmarks = ",".join("?" * len(guids))
+        for r in conn.execute(
+                "SELECT r.src_path, count(*) c FROM refs r WHERE r.dst_guid"
+                f" IN ({gmarks}) GROUP BY r.src_path ORDER BY c DESC LIMIT ?",
+                guids + [limit]):
+            if r["src_path"] in rels:
+                continue
+            out["top_asset_dependents"].append({"asset": r["src_path"],
+                                                "refs": r["c"]})
+        out["event_bindings"] = conn.execute(
+            "SELECT count(*) FROM events WHERE target_guid IN"
+            f" ({gmarks})", guids).fetchone()[0]
+
+    conn.close()
+    return out
+
+
+# core profile 的五个日常查询工具;usage 报告里拿它们做「零调用」告警
+CORE_TOOLS = ("unity_impact", "unity_refs", "unity_components",
+              "unity_find", "unity_context")
+
+
+def usage_report(project_root: str) -> Dict:
+    """MCP 工具采用率报告:读 calls.log,回答「模型到底在用哪些工具」。
+
+    背景:好几轮优化都靠人工翻 calls.log 发现「刷新占七成、refs/components
+    零调用」这类问题。把它做成命令,让测量变成日常一键而不是评审仪式。
+    """
+    import time as _time
+    path = os.path.join(os.path.abspath(project_root), ".unity-llm", "calls.log")
+    if not os.path.exists(path):
+        return {"hint": "没有 .unity-llm/calls.log —— 还没有 MCP 调用记录,"
+                        "或日志被 UNITY_LLM_NO_LOG=1 关掉了"}
+    by_tool: Dict[str, Dict] = {}
+    total = {"calls": 0, "approx_tokens": 0, "errors": 0}
+    t_min = t_max = None
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            tool = rec.get("tool") or "?"
+            d = by_tool.setdefault(tool, {"calls": 0, "approx_tokens": 0,
+                                          "errors": 0})
+            d["calls"] += 1
+            d["approx_tokens"] += rec.get("approx_tokens") or 0
+            if rec.get("error"):
+                d["errors"] += 1
+                total["errors"] += 1
+            total["calls"] += 1
+            total["approx_tokens"] += rec.get("approx_tokens") or 0
+            t = rec.get("t")
+            if t:
+                t_min = t if t_min is None else min(t_min, t)
+                t_max = t if t_max is None else max(t_max, t)
+    out: Dict = {
+        "total": total,
+        "by_tool": sorted(
+            ({"tool": k, **v} for k, v in by_tool.items()),
+            key=lambda d: -d["calls"]),
+    }
+    if t_min:
+        out["range"] = {
+            "from": _time.strftime("%Y-%m-%d %H:%M", _time.localtime(t_min)),
+            "to": _time.strftime("%Y-%m-%d %H:%M", _time.localtime(t_max)),
+        }
+    # 刷新占比:update 占大头 = 图谱在被维护但没被消费,正是历史上
+    # 真实发生过的问题(Round 5/7 的发现)
+    upd = sum(d["calls"] for k, d in by_tool.items() if k == "unity_update")
+    if total["calls"]:
+        out["update_share"] = round(upd / total["calls"], 3)
+    zero = [t for t in CORE_TOOLS if t not in by_tool]
+    if zero:
+        out["never_called"] = zero
+    conn_tool_calls = total["calls"] - upd
+    if total["calls"] and conn_tool_calls == 0:
+        out["hint"] = ("全部调用都是 unity_update(图谱刷新),没有任何查询 —— "
+                       "图谱在被维护,没被消费")
     return out
 
 

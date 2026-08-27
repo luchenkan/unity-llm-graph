@@ -929,6 +929,103 @@ def test_visual_query_end_to_end():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_stale_detection():
+    print("[29] stale 检测(图谱落后于磁盘时查询必须告警)")
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="unity_llm_test_")
+    try:
+        dst = os.path.join(tmp, "Proj")
+        shutil.copytree(FIXTURE, dst, ignore=shutil.ignore_patterns(".unity-llm"))
+        graph.build(dst)
+        r = queries.impact(dst, "Enemy")
+        check("新鲜图谱不带 stale 告警", "graph_stale" not in r, str(r.get("graph_stale")))
+        # 改磁盘不改图:模拟 hook 挂掉 / pull 后还没刷
+        enemy = os.path.join(dst, "Assets", "Scripts", "Enemy.cs")
+        open(enemy, "a", encoding="utf-8").write("\n// touched\n")
+        r2 = queries.impact(dst, "Enemy")
+        check("磁盘变过 -> impact 带 graph_stale",
+              "graph_stale" in r2
+              and any(x["path"].endswith("Enemy.cs")
+                      for x in r2["graph_stale"]["files"]), str(r2.get("graph_stale")))
+        rr = queries.find_refs(dst, "Enemy")
+        check("refs 同样带 graph_stale", "graph_stale" in rr)
+        # update 之后告警消失
+        graph.update_files(dst, ["Assets/Scripts/Enemy.cs"])
+        r3 = queries.impact(dst, "Enemy")
+        check("update 后告警消失", "graph_stale" not in r3, str(r3.get("graph_stale")))
+        # 老库(没有 file_state 表)必须静默降级,不报错也不误报
+        conn = graph.connect(dst)
+        conn.execute("DROP TABLE file_state")
+        conn.commit()
+        conn.close()
+        open(enemy, "a", encoding="utf-8").write("\n// touched again\n")
+        r4 = queries.impact(dst, "Enemy")
+        check("老库无 file_state -> 不告警也不报错",
+              "graph_stale" not in r4 and "错误" not in str(r4.get("hint", "")),
+              str(r4.get("graph_stale")))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_digest():
+    print("[30] digest(一批变更文件的影响面摘要)")
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="unity_llm_test_")
+    try:
+        dst = os.path.join(tmp, "Proj")
+        shutil.copytree(FIXTURE, dst, ignore=shutil.ignore_patterns(".unity-llm"))
+        graph.build(dst)
+        d = queries.digest(dst, ["Assets/Scripts/Enemy.cs",
+                                 "Assets/Prefabs/Enemy.prefab"])
+        check("文件分类正确",
+              d["files_total"] == 2 and d["scripts"] == 1
+              and d["yaml_assets"] == 1, str(d))
+        check("调用方聚合含 Player",
+              any("Player" in c["caller"] for c in d["top_code_callers"]),
+              str(d["top_code_callers"]))
+        check("资产引用方聚合含 Main.unity",
+              any("Main.unity" in a["asset"] for a in d["top_asset_dependents"]),
+              str(d["top_asset_dependents"]))
+        check("挂载点统计到 Enemy.prefab", d["mounted_by"] >= 1, str(d))
+        d2 = queries.digest(dst, ["Assets/NoSuchFile.cs"])
+        check("未知文件进 unknown 不报错",
+              d2["unknown"] == ["Assets/NoSuchFile.cs"], str(d2))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_usage():
+    print("[31] usage(MCP 工具采用率报告)")
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="unity_llm_test_")
+    try:
+        dst = os.path.join(tmp, "Proj")
+        os.makedirs(os.path.join(dst, ".unity-llm"))
+        with open(os.path.join(dst, ".unity-llm", "calls.log"),
+                  "w", encoding="utf-8") as f:
+            f.write(json.dumps({"t": 1700000000, "tool": "unity_update",
+                                "chars": 10, "approx_tokens": 5}) + "\n")
+            f.write(json.dumps({"t": 1700000001, "tool": "unity_update",
+                                "chars": 10, "approx_tokens": 5}) + "\n")
+            f.write(json.dumps({"t": 1700000002, "tool": "unity_impact",
+                                "chars": 400, "approx_tokens": 100}) + "\n")
+        u = queries.usage_report(dst)
+        check("工具计数正确",
+              u["total"]["calls"] == 3
+              and u["by_tool"][0]["tool"] == "unity_update", str(u))
+        check("刷新占比 2/3", abs(u["update_share"] - 0.667) < 0.01, str(u))
+        check("零调用核心工具被点名",
+              "unity_refs" in u["never_called"]
+              and "unity_components" in u["never_called"], str(u))
+        u2 = queries.usage_report(os.path.join(tmp, "Empty"))
+        check("无日志时给人话提示", "hint" in u2, str(u2))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -944,7 +1041,8 @@ def main():
              test_parser_masking, test_partial_and_relay,
              test_correctness_hardening, test_atomic_build, test_hierarchy,
              test_build_progress, test_visual_assets,
-             test_visual_query_end_to_end]
+             test_visual_query_end_to_end,
+             test_stale_detection, test_digest, test_usage]
     failed = 0
     for t in tests:
         try:

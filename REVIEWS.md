@@ -29,6 +29,7 @@ Two MCP servers can and should run together: this one answers “what is coupled
 | 5 | Cursor Grok 4.6 | Reviewed against a real ~37.5k-asset project **and** MCP call logs, not the fixture. Then patched 0.5.0. |
 | 6 | GPT-5.6 Sol | Re-prioritized correctness before token claims; patched namespace resolution, dead-code false negatives, deletion tombstones, strict context budgets, MCP profiles, and atomic builds for 0.6.0. |
 | 7 | DeepSeek-V4-Pro | Reviewed **adoption**, not the fixture: read a production project's `calls.log`, token ledger, hook config, and a competing Editor MCP. Found Grok 4.6's diagnosis was still unfixed, then patched 0.7.0 to take the Editor MCP's "list hierarchy / components" query off the table. |
+| 9 | GLM-5.3 | Author of 0.7.3 (pull/merge/rebase auto-refresh hooks) and 0.8.0 (stale detection, `digest`, `usage`, error self-correction). Works daily on the same production project. |
 
 Round 5 is the first pass that measured **which tools models actually invoked**, and that rejected encoding one game’s bus type into the engine.
 
@@ -179,3 +180,69 @@ feature review:
    URL/username.
 
 Re-ran `python tests/run_tests.py`: **142 assertions / 25 groups passing**.
+
+## Round 9 — freshness & proactive value (0.7.3 + 0.8.0)
+
+Reviewed by **GLM-5.3** (Tencent CodeBuddy), which is not a fly-by reviewer: it
+runs this graph daily on the same ~37.5k-asset production project through both
+the MCP server and the git hooks, and authored 0.7.3 earlier the same day.
+
+### 0.7.3 — closing the pull gap
+
+`post-commit` alone meant **pulled-in remote changes left the graph stale** —
+exactly the failure mode this engine exists to prevent (someone else restructures
+a prefab, you pull, every later query silently answers from the old structure).
+Shipped `tools/post-merge.sample` (fires on `git pull` ff/merge and `git merge`)
+and `tools/post-rewrite.sample` (`pull --rebase` / `rebase` / `commit --amend`;
+the rebase path never triggers post-merge). Both diff `ORIG_HEAD..HEAD`; update
+is idempotent so re-replayed local commits are harmless. Verified on the
+production repo; pushed to GitHub.
+
+### 0.8.0 — "know when you're wrong" + "speak before being asked"
+
+The eight prior rounds made the engine *correct*. Two failure classes remained,
+both invisible in fixture tests:
+
+1. **Silent staleness is the most dangerous failure mode.** Hooks run in the
+   background and fail silently by design — when they die, the graph freezes
+   and every subsequent query returns confident wrong answers. Fix:
+   `file_state(path, mtime, size)` written by build/update; `impact / refs /
+   components / animator / timeline` now validate the target's files and attach
+   a `graph_stale: {warning, files}` block when disk has moved on. Old DBs
+   without the table degrade silently — no error, no false alarm. This moves
+   the trustworthiness line from build-time into query-time, where it belongs.
+2. **The graph knows, nobody asks.** After a pull brings in 200 files, the
+   answers existed but were never queried. `digest` eats a whole file batch
+   (stdin pipe from `git diff`) and aggregates top code callers / top asset
+   dependents / mount-point count — a blast-radius summary for pull and code
+   review, instead of N full impact reports. And `usage` productizes the
+   Round 5/7 methodology: tool histogram, `unity_update` share, zero-call
+   warnings for core query tools, straight from `calls.log`.
+
+Also fixed: unknown-tool MCP errors now list the available tools for the active
+profile instead of three bare characters (models retried the same call in the
+wild — the log proves it).
+
+### Measured on the production project (not the fixture)
+
+`usage` on the real `calls.log` (172 calls, 2026-08-13 → 08-27):
+`unity_components` 57 / `unity_find` 56 / `unity_impact` 25 / `unity_context`
+23 / `unity_refs` 8, `update_share = 0.0` (refresh goes through git hooks, not
+MCP). The Round 7 disease — refs/components at zero — is **cured**; the 0.7.0
+objects table is being used as intended. `digest` on a real 17-file commit
+returned a sensible caller ranking (BattleFormationMono 97 calls on top).
+The three logged `未知工具` errors turned out to be **stale server processes
+predating 0.7.2** (core profile gained animator/timeline then) — historical,
+not a live bug, but exactly the kind of thing nobody would ever have noticed
+without the report.
+
+### Deliberately not implemented in this round
+
+- AnimationEvent `functionName` ingestion (cheap and deadcode-relevant, but
+  wants a fixture with `.anim` events first).
+- Addressables/YooAsset bundle-group analysis (high value on this project,
+  needs a representative fixture with real group configs).
+- Roslyn backend — still the wrong trade against the zero-dep contract.
+
+Tests: 172 → **186 assertions / 31 groups**, all green; real-project smoke
+tests for stale downgrade, digest and usage documented above.

@@ -9,6 +9,8 @@
     python -m unity_llm deadcode   --project ...
     python -m unity_llm validate   --project ...
     python -m unity_llm context    --project ... --target Enemy --budget 1500
+    python -m unity_llm digest     --project ... --files -        # stdin: 变更文件列表
+    python -m unity_llm usage      --project ...                  # MCP 工具采用率
     python -m unity_llm serve      --project ...      # MCP stdio server
     python -m unity_llm init-config                   # 生成各客户端 MCP 配置示例
 """
@@ -96,7 +98,27 @@ def cmd_validate(args) -> int:
 
 
 def cmd_update(args) -> int:
-    _print(args, graph.update_files(_project(args), args.files))
+    _print(args, graph.update_files(_project(args), _read_files_arg(args)))
+    return 0
+
+
+def _read_files_arg(args) -> list:
+    """--files 支持 '-' 从 stdin 读(每行一个路径),方便接 git diff 管道。"""
+    files = args.files
+    if files == ["-"]:
+        files = [ln.strip() for ln in sys.stdin
+                 if ln.strip() and not ln.strip().startswith("#")]
+    return files
+
+
+def cmd_digest(args) -> int:
+    _print(args, queries.digest(_project(args), _read_files_arg(args),
+                                limit=args.limit))
+    return 0
+
+
+def cmd_usage(args) -> int:
+    _print(args, queries.usage_report(_project(args)))
     return 0
 
 
@@ -257,8 +279,24 @@ def build_parser() -> argparse.ArgumentParser:
     add_project(sp)
     sp.add_argument("--files", nargs="+", required=True,
                     help="项目相对路径,如 Assets/Scripts/Enemy.cs;"
-                         "文件已删除则清除其图数据")
+                         "传 '-' 则从 stdin 读(每行一个路径);文件已删除则清除其图数据")
     sp.set_defaults(func=cmd_update)
+
+    sp = sub.add_parser("digest",
+                        help="一批变更文件的影响面摘要(pull / code review 后"
+                             "先看波及谁,再决定细查哪)")
+    add_project(sp)
+    sp.add_argument("--files", nargs="+", required=True,
+                    help="项目相对路径,可传 '-' 从 stdin 读"
+                         "(如 git diff --name-only HEAD~1 | unity-llm digest --files -)")
+    add_limit(sp, default=12)
+    sp.set_defaults(func=cmd_digest)
+
+    sp = sub.add_parser("usage",
+                        help="MCP 工具采用率报告:读 calls.log,看模型到底"
+                             "在用哪些工具、图谱有没有被消费")
+    add_project(sp)
+    sp.set_defaults(func=cmd_usage)
 
     sp = sub.add_parser("context", help="为目标生成 token 预算内的 LLM 上下文包")
     add_project(sp)

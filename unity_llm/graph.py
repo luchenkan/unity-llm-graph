@@ -178,6 +178,11 @@ CREATE TABLE IF NOT EXISTS visual_refs (
     name TEXT NOT NULL DEFAULT '',
     dst_guid TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS file_state (
+    path TEXT PRIMARY KEY,        -- 已收录文件的解析时状态,查询期用来发现
+    mtime REAL NOT NULL,          -- 「磁盘已改、图谱还是旧的」——stale 检测
+    size INTEGER NOT NULL
+);
 """
 
 INDEX_SCHEMA = """
@@ -741,6 +746,7 @@ def build(project_root: str, verbose: bool = False,
         try:
             with open(abspath, "r", encoding="utf-8", errors="replace") as f:
                 n = _insert_csharp(cur, f.read(), rel, guid, ext_flag)
+            _record_file_state(cur, abspath, rel)
         except Exception:
             stats["errors"] += 1
             continue
@@ -763,6 +769,7 @@ def build(project_root: str, verbose: bool = False,
                 text = f.read()
             n = _insert_yaml(cur, text, rel, guid)
             _insert_visual_structure(cur, text, rel, guid)
+            _record_file_state(cur, abspath, rel)
         except Exception:
             stats["errors"] += 1
             continue
@@ -781,6 +788,7 @@ def build(project_root: str, verbose: bool = False,
         try:
             with open(abspath, "r", encoding="utf-8", errors="replace") as f:
                 _insert_visual_structure(cur, f.read(), rel, guid)
+            _record_file_state(cur, abspath, rel)
         except Exception:
             stats["errors"] += 1
             continue
@@ -815,6 +823,50 @@ def build(project_root: str, verbose: bool = False,
         f"完成 {stats['seconds']}s  assets={stats['assets']} "
         f"scripts={stats['scripts']} yaml={stats['yaml_assets']}")
     return stats
+
+
+def _record_file_state(cur, abspath: str, rel: str) -> None:
+    """记下「这份文件按这个磁盘状态解析的」,供查询期 stale 检测比对。"""
+    try:
+        st = os.stat(abspath)
+        cur.execute(
+            "INSERT OR REPLACE INTO file_state(path, mtime, size) VALUES (?,?,?)",
+            (rel, st.st_mtime, st.st_size))
+    except OSError:
+        pass  # 记不到就不记,查询期只会少一个告警,不会多
+
+
+def check_stale(conn, project_root: str, rel_paths, limit: int = 5) -> List[Dict]:
+    """找出「图谱收录过、但磁盘版本已经变了」的文件。
+
+    背景:增量更新靠 git hook 后台跑且静默失败,挂掉时图谱会悄悄冻结,
+    之后每次查询都在旧结构上给出自信的错答案 —— 这是最危险的失败模式。
+    这里用建图时记下的 mtime/size 反查,发现不一致就报出来。
+
+    老库没有 file_state 表、或该文件没记录(只 update 过部分文件的库):
+    一律视为「无信息」,不告警 —— 宁可漏报,不制造假警报。
+    """
+    out: List[Dict] = []
+    try:
+        rows = conn.execute(
+            "SELECT path, mtime, size FROM file_state WHERE path IN"
+            f" ({','.join('?' * len(rel_paths))})", list(rel_paths)).fetchall()
+    except sqlite3.Error:
+        return out  # 老库没有这张表
+    root = os.path.abspath(project_root)
+    for r in rows:
+        disk = os.path.join(root, *r["path"].split("/"))
+        try:
+            st = os.stat(disk)
+        except OSError:
+            continue  # 磁盘上没了但图里还在?update 删除路径会清;这里不管
+        if abs(st.st_mtime - r["mtime"]) > 0.001 or st.st_size != r["size"]:
+            out.append({"path": r["path"],
+                        "graph_at": int(r["mtime"]),
+                        "disk_at": int(st.st_mtime)})
+            if len(out) >= limit:
+                break
+    return out
 
 
 def update_files(project_root: str, rel_paths) -> dict:
@@ -876,6 +928,7 @@ def update_files(project_root: str, rel_paths) -> dict:
                 cur.execute(f"DELETE FROM {table} WHERE src_guid=?",
                             (old_asset["guid"],))
         cur.execute("DELETE FROM assets WHERE path=?", (rel,))
+        cur.execute("DELETE FROM file_state WHERE path=?", (rel,))
         if not os.path.exists(abspath):
             if old_asset:
                 # 保留最小 tombstone:查询旧路径/guid 仍能解释悬空入边,
@@ -903,6 +956,7 @@ def update_files(project_root: str, rel_paths) -> dict:
                 _insert_visual_structure(cur, text, rel, guid)
             elif ext in JSON_ASSET_EXTS:
                 _insert_visual_structure(cur, text, rel, guid)
+            _record_file_state(cur, abspath, rel)
             out["updated"].append(rel)
         except Exception as e:
             out["errors"].append({"file": rel, "error": str(e)})

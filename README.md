@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-147%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-186%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / methods / calls / inheritance / engine lifecycle callbacks)
@@ -144,6 +144,9 @@ MCP server 会把每次工具调用记一行 JSON:工具名、参数、返回体
 ```bash
 # 本次会话所有工具调用一共花了多少 token
 python -c "import json,sys;print(sum(json.loads(l)['approx_tokens'] for l in open(sys.argv[1],encoding='utf-8') if l.strip()))" /path/to/Proj/.unity-llm/calls.log
+
+# 或者直接用内置报告:工具直方图 + 零调用告警
+python -m unity_llm usage --project /path/to/Proj
 ```
 
 ### 避免全文读取的估算上限:`tools/token_report.py`
@@ -234,6 +237,19 @@ python -m unity_llm context --project /path/to/Proj --target Enemy --budget 1500
 
 MCP 查询不会隐式触发全量建图。首次使用先显式运行 `build`;中型项目大约 8-10 分钟,
 期间 stderr 有进度输出,避免看起来像卡住。`rebuild` 只在 `admin/full` profile 暴露。
+
+**图谱过期自动告警(stale 检测)**:增量更新靠 git hook 后台跑且静默失败,挂掉时
+图谱会悄悄冻结,之后每次查询都在旧结构上给出自信的错答案 —— 这是最危险的失败
+模式。0.8.0 起建图/更新会记录每个收录文件的 mtime/size(`file_state` 表),
+`impact / refs / components / animator / timeline` 查询时校验目标文件:
+发现磁盘版本变了,返回体里会出现 `graph_stale: {warning, files}`,提醒先
+`update` 再下结论。老库没有这张表时静默降级,不报错也不误报。
+
+**采用率度量**:`python -m unity_llm usage` 把 `.unity-llm/calls.log` 聚合成
+工具直方图:每个工具的调用次数/token/错误、`unity_update` 刷新占比、core
+查询工具零调用告警。回答「模型到底在用哪些工具、图谱有没有被消费」——
+这个方法曾发现过「刷新占七成、refs/components 零调用」的真实问题,现在是
+一条命令的事。
 
 ## 让模型真的用上它(重要)
 
@@ -386,6 +402,12 @@ python -m unity_llm deadcode    --project P [--include-external] [--limit 60]
 python -m unity_llm validate    --project P [--limit 60]
 python -m unity_llm update      --project P --files Assets/Scripts/Enemy.cs [...]
                                  # 增量更新指定文件(秒级);文件已删除则清除其数据
+                                 # --files - 可从 stdin 读(接 git diff 管道)
+python -m unity_llm digest     --project P --files Assets/... [...]
+                                 # 一批变更文件的影响面摘要:调用方/引用方/挂载点 top 榜
+                                 # pull / code review 后先看波及谁再决定细查哪
+python -m unity_llm usage      --project P
+                                 # MCP 工具采用率:读 calls.log 出直方图 + 零调用告警
 python -m unity_llm context     --project P --target T [--budget 2000] [--out ctx.md]
 python -m unity_llm serve       --project P [--profile core|full|admin]
 python -m unity_llm init-config --project P [--profile core|full|admin]
@@ -438,7 +460,8 @@ python tests/run_tests.py
 死代码误报控制、**方法组引用(`method_ref`)**、**解析器注释/字符串遮蔽回归**、
 悬空引用体检、上下文打包、MCP 握手与 `tools/call`、**增量更新(改/增/删)**
 并覆盖 partial、namespace 重名、原子 build、tombstone、MCP profile 和严格
-token 预算。共 **147 项断言 / 26 个测试组**。
+token 预算,以及 **stale 检测(磁盘变更告警/老库降级)、digest 聚合、usage
+采用率报告**。共 **186 项断言 / 31 个测试组**。
 
 ## 能力与局限(诚实声明)
 
@@ -457,6 +480,28 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
 
 ## Changelog
+
+### 0.8.0
+
+主题:「知道自己什么时候答错了」+「不等人问就说」。前七轮把「答得对」打磨到位后,
+剩下的最大风险是图谱静默过期,最大的浪费是图谱知识没人来问。
+
+- **stale 检测(图谱新鲜度自验证)**:build/update 记录每个收录文件的
+  mtime/size(`file_state` 表);`impact / refs / components / animator / timeline`
+  查询时校验目标文件,磁盘版本变了就在返回体里带 `graph_stale` 告警。防线从
+  建图期延伸到查询期 —— hook 后台静默失败时,用户至少能从查询结果里看出
+  「这结论基于旧结构」。老库(无 file_state 表)静默降级,不误报。
+- **`digest` 命令(多文件影响面摘要)**:一次吃进整批变更文件(git diff 的
+  输出,`--files -` 支持 stdin 管道),聚合出「调用方类型 top / 引用方资产 top /
+  prefab 挂载点数」三张榜。pull / code review 后先看波及谁,再决定细查哪。
+  与 git hooks(0.7.3)衔接:图谱知道答案,现在让答案主动可见。
+- **`usage` 命令(MCP 工具采用率)**:把 Round 5/7 人工翻 calls.log 的方法论
+  产品化 —— 工具直方图、`unity_update` 刷新占比、core 查询工具零调用告警。
+  在真实项目(172 次调用)上验证:挖出 3 条 8 月中旬旧版 server 的
+  「未知工具」历史错误。
+- **未知工具报错带自纠信息**:MCP 调 profile 外工具时,错误信息附上当前
+  可用工具清单,不再只回「未知工具」三个字(实测模型会原样重试浪费轮次)。
+- 测试 172 → **186 项断言 / 31 组**;README badge 与实测数字同步。
 
 ### 0.7.3
 
@@ -598,6 +643,8 @@ fileID 对象图:
       PostToolUse hook(`tools/hook_post_edit.py`)
 - [x] pull / merge / rebase 拉取后自动增量更新(`tools/post-merge.sample` /
       `tools/post-rewrite.sample`)
+- [x] 图谱新鲜度自验证(查询期 stale 告警,`file_state` 表)+ 多文件影响面
+      摘要(`digest`)+ 采用率度量(`usage`)
 - [x] 链式静态字段调用(`Type.Field.Method()`,含事件总线 / 单例)
 - [ ] 文件监听 daemon(免 hook,编辑器里手改也实时跟)
 - [x] UnityEvent / Inspector 事件绑定的 YAML 提取
@@ -612,7 +659,7 @@ fileID 对象图:
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 147 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 186 项断言全绿。
 
 历次模型评审记录见 [REVIEWS.md](REVIEWS.md)(Kimi k3 / Claude Opus 5 /
 Cursor Grok 4.6 / GPT-5.6 Sol)。下一轮请对着真实项目和 `calls.log` 审,

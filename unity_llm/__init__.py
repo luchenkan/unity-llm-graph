@@ -10,4 +10,4 @@
   - context pack : 按 token 预算生成精简上下文,喂给不支持工具的模型
 """
 
-__version__ = "0.7.3"
+__version__ = "0.8.0"

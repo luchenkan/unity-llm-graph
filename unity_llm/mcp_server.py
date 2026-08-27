@@ -367,7 +367,13 @@ def make_dispatcher(project_root: str,
                     "会话内也可不调,交给 git post-commit hook。")
             out = graph.update_files(project_root, list(paths))
         else:
-            raise ValueError(f"未知工具: {name}")
+            # 带上可用工具清单,让模型一次自纠(实测发生过模型调用
+            # profile 外工具、只拿到「未知工具」三个字后反复重试的浪费)
+            avail = ", ".join(sorted(allowed_tools)) if allowed_tools else \
+                "全部 unity_* 工具"
+            raise ValueError(
+                f"未知工具: {name}。本会话可用: {avail}。"
+                "改名/换可用工具,不要原样重试")
         return out
     return dispatch
 
