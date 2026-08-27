@@ -1,0 +1,33 @@
+#!/bin/sh
+# unity-llm-graph: git post-rewrite hook —— pull --rebase / rebase 后增量刷新依赖图谱。
+#
+# 习惯 rebase 的团队(pull --rebase,历史一条线)不触发 post-merge,
+# 需要 post-rewrite:rebase 重放提交后、以及 commit --amend 后都会触发它。
+#
+# 装法:
+#   cp tools/post-rewrite.sample <repo>/.git/hooks/post-rewrite
+#   chmod +x <repo>/.git/hooks/post-rewrite
+#   然后把下面 UNITY_LLM_DIR 改成本框架仓库路径
+#
+# rebase 前 git 会把 ORIG_HEAD 设为 rebase 前的 HEAD,
+# diff ORIG_HEAD..HEAD 即本次净变化 = 远端拉入 + 本地提交重放。
+# 重放部分已由 post-commit 刷过,update 是幂等增量,多刷无害 —— 宁可多刷不漏刷。
+# (amend 触发时 ORIG_HEAD 可能是陈旧值,diff 只是多覆盖几个文件,同样幂等无害。)
+# 后台执行 + 静默失败,永不阻塞 rebase。
+
+UNITY_LLM_DIR="/c/Users/you/unity-llm-graph"
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$ROOT/.unity-llm/graph.db" ] || exit 0   # 没建过图就不管
+
+BASE=$(git rev-parse ORIG_HEAD 2>/dev/null) || exit 0
+
+FILES=$(git diff --name-only "$BASE" HEAD \
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$')
+[ -z "$FILES" ] && exit 0
+
+cd "$UNITY_LLM_DIR" 2>/dev/null || exit 0
+python -m unity_llm update --project "$ROOT" --files $FILES \
+    >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+
+exit 0

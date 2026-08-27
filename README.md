@@ -260,24 +260,27 @@ MCP 查询不会隐式触发全量建图。首次使用先显式运行 `build`;�
 - 只要签名 + 依赖:unity_context(比读整个文件省 token)
 
 ## 改完代码后
-不要在会话里例行调 unity_update。交给 git post-commit hook。
+不要在会话里例行调 unity_update。交给 git hooks(post-commit / post-merge / post-rewrite)。
 只有接下来还要查刚改过的文件时才调一次。
 ```
 
 命中率高但不是 100%:规则是提示,不是强制。
 
-### 档 2:git post-commit hook(推荐,便宜且覆盖手改)
+### 档 2:git hooks(推荐,便宜且覆盖手改 + pull)
 
 提交后批量增量更新一次。也覆盖你在 Unity 编辑器里手改的 prefab/scene ——
-那些改动模型根本不知道。现成模板 `tools/post-commit.sample`:
+那些改动模型根本不知道。**以及 `git pull` 拉进来的远端提交**:别人改了
+prefab 结构,你 pull 完图谱如果还是旧的,查询结论就是错的。三个模板按需装:
 
 ```bash
-cp tools/post-commit.sample <repo>/.git/hooks/post-commit
-chmod +x <repo>/.git/hooks/post-commit
-# 编辑首行的 UNITY_LLM_DIR,指向本框架仓库
+cp tools/post-commit.sample  <repo>/.git/hooks/post-commit    # 本地提交后
+cp tools/post-merge.sample    <repo>/.git/hooks/post-merge    # git pull / merge 后(fast-forward 也触发)
+cp tools/post-rewrite.sample  <repo>/.git/hooks/post-rewrite  # pull --rebase / rebase 后
+chmod +x <repo>/.git/hooks/post-*
+# 编辑每个文件首行的 UNITY_LLM_DIR,指向本框架仓库
 ```
 
-内容:
+post-commit 的内容:
 
 ```bash
 #!/bin/sh
@@ -294,8 +297,16 @@ python -m unity_llm update --project "$ROOT" --files $FILES \
 exit 0
 ```
 
-后台跑、失败静默、永不阻塞提交。git worktree 下 hook 是**多个 worktree 共享**的,
-上面用 `git rev-parse --show-toplevel` 动态取项目根,所以每个 worktree 各更新自己的图。
+post-merge / post-rewrite 与之唯一的区别是差异文件的计算方式:pull / merge /
+rebase 前 git 都会把 `ORIG_HEAD` 设为更新前的 HEAD,所以用
+`git diff --name-only ORIG_HEAD HEAD` 拿「本次拉入的净变化」。习惯
+`pull --rebase`(历史一条线)的必须装 post-rewrite —— rebase 路径不触发
+post-merge;它重放的本地提交虽已被 post-commit 刷过,但 update 是幂等增量,
+多刷无害,宁可多刷不漏刷。
+
+后台跑、失败静默、永不阻塞提交/pull/rebase。git worktree 下 hook 是
+**多个 worktree 共享**的,上面用 `git rev-parse --show-toplevel` 动态取项目根,
+所以每个 worktree 各更新自己的图。
 
 ### 档 3:Claude Code PostToolUse hook(实时,但吵)
 
@@ -447,6 +458,20 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
 
 ## Changelog
 
+### 0.7.3
+
+补上 pull 拉取后图谱不更新的缺口(此前只有 post-commit,本地提交才刷图):
+
+- **新增 `tools/post-merge.sample`**:`git pull`(fast-forward 或产生 merge commit)
+  和 `git merge` 之后增量刷新。差异文件用 `git diff --name-only ORIG_HEAD HEAD`
+  —— pull/merge 前 git 一定把 ORIG_HEAD 设为更新前的 HEAD。
+- **新增 `tools/post-rewrite.sample`**:覆盖 `git pull --rebase` / `git rebase`
+  (rebase 路径不触发 post-merge)。也覆盖 `commit --amend`。同一套 ORIG_HEAD
+  差异逻辑;重放的本地提交虽已被 post-commit 刷过,update 幂等,多刷无害。
+- README「档 2」改为三个 hook 的组合说明:本地提交 / 手改 + pull / pull --rebase
+  全覆盖,已实装在 3.75 万资产的真实项目上验证。
+- 三个 hook 均后台执行、静默失败、不阻塞 git 操作;pull 无变化时 diff 为空直接退出。
+
 ### 0.7.2
 
 Timeline / Animator 资产录入补全(视觉资产扩展 Phase 1 收口,详见
@@ -571,6 +596,8 @@ fileID 对象图:
 - [x] 增量更新(`update` / `unity_update`:只重建变更文件)
 - [x] git hook 自动触发增量更新(`tools/post-commit.sample`)+ Claude Code
       PostToolUse hook(`tools/hook_post_edit.py`)
+- [x] pull / merge / rebase 拉取后自动增量更新(`tools/post-merge.sample` /
+      `tools/post-rewrite.sample`)
 - [x] 链式静态字段调用(`Type.Field.Method()`,含事件总线 / 单例)
 - [ ] 文件监听 daemon(免 hook,编辑器里手改也实时跟)
 - [x] UnityEvent / Inspector 事件绑定的 YAML 提取

@@ -1,0 +1,34 @@
+#!/bin/sh
+# unity-llm-graph: git post-merge hook —— pull / merge 后增量刷新依赖图谱。
+#
+# git pull(无论 fast-forward 还是产生 merge commit)和 git merge 都会触发
+# post-merge。本地提交已有 post-commit 兜底,这个 hook 补的是**拉进来的**
+# 远端提交 —— 比如别人改的 prefab 结构,以前 pull 完图谱是旧的。
+#
+# 装法:
+#   cp tools/post-merge.sample <repo>/.git/hooks/post-merge
+#   chmod +x <repo>/.git/hooks/post-merge
+#   然后把下面 UNITY_LLM_DIR 改成本框架仓库路径
+#
+# pull/merge 前 git 一定把 ORIG_HEAD 设为更新前的 HEAD,
+# diff ORIG_HEAD..HEAD 就是本次拉入的变更文件。
+# git worktree:hook 目录是多个 worktree 共享的,这里用 --show-toplevel
+# 动态取当前项目根,所以每个 worktree 各自更新自己的图谱。
+# 后台执行 + 静默失败,永不阻塞 pull。已是最新(无变化)时 diff 为空,直接退出。
+
+UNITY_LLM_DIR="/c/Users/you/unity-llm-graph"
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$ROOT/.unity-llm/graph.db" ] || exit 0   # 没建过图就不管
+
+BASE=$(git rev-parse ORIG_HEAD 2>/dev/null) || exit 0
+
+FILES=$(git diff --name-only "$BASE" HEAD \
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$')
+[ -z "$FILES" ] && exit 0
+
+cd "$UNITY_LLM_DIR" 2>/dev/null || exit 0
+python -m unity_llm update --project "$ROOT" --files $FILES \
+    >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+
+exit 0
