@@ -99,6 +99,25 @@ TOOLS = [
         },
     },
     {
+        "name": "unity_error_report",
+        "description": ("错误现场打包:把一段 Unity 堆栈(NullReferenceException 等,"
+                        "Console 右键复制 / logcat 原文)整个贴进来,返回堆栈里每个"
+                        "用户代码类型的迷你影响面 —— top 调用方/引用方。"
+                        "调异常时先调它,不要只靠读堆栈猜。"),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "error_text": {"type": "string",
+                               "description": "完整错误堆栈文本"},
+                "limit": {"type": "integer", "default": 5,
+                          "description": "最多分析的堆栈类型数"},
+                "impact_limit": {"type": "integer", "default": 6,
+                                 "description": "每个类型的 top 调用方条数"},
+            },
+            "required": ["error_text"],
+        },
+    },
+    {
         "name": "unity_find",
         "description": ("按名字搜类型/成员/资产,返回精简索引(名+路径),不是全文。"
                         "用来确认短名后再跟 unity_impact / unity_refs;"
@@ -212,7 +231,8 @@ TOOLS = [
 PROFILES = {
     # 日常会话只暴露查询工具,避免把维护工具 schema 和错误选项塞进模型上下文。
     "core": ("unity_impact", "unity_refs", "unity_components",
-             "unity_find", "unity_context", "unity_animator", "unity_timeline"),
+             "unity_find", "unity_context", "unity_animator", "unity_timeline",
+             "unity_error_report"),
     "full": tuple(t["name"] for t in TOOLS),
     "admin": ("unity_stats", "unity_dead_code", "unity_validate",
               "unity_rebuild", "unity_update"),
@@ -226,6 +246,7 @@ _DEFAULT_LIMITS = {
     "unity_validate": 20,
     "unity_animator": 20,
     "unity_timeline": 20,
+    "unity_error_report": 5,
 }
 
 
@@ -358,6 +379,12 @@ def make_dispatcher(project_root: str,
             out = context_mod.build_context(
                 project_root, args["target"],
                 budget_tokens=int(args.get("budget", 2000)))
+        elif name == "unity_error_report":
+            out = queries.error_report(
+                project_root, args.get("error_text", ""),
+                limit=int(args.get("limit", _DEFAULT_LIMITS.get(
+                    "unity_error_report", 5))),
+                impact_limit=int(args.get("impact_limit", 6)))
         elif name == "unity_update":
             paths = args.get("paths")
             if not paths:

@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-186%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-191%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / methods / calls / inheritance / engine lifecycle callbacks)
@@ -231,6 +231,7 @@ python -m unity_llm context --project /path/to/Proj --target Enemy --budget 1500
 | `unity_validate`   | 体检:指向不存在资产的悬空 guid(已排除引擎内置),以及 `.meta` guid 被改写工具处理过的告警         |
 | `unity_context`    | token 预算内的精简上下文包(签名 + 依赖),改代码前先调它                               |
 | `unity_find`       | 按名字模糊搜索类型 / 成员 / 资产(第三方目录排在后面)                                  |
+| `unity_error_report` | **错误现场打包**:贴一段 Unity 堆栈,返回每个涉事类型的迷你影响面(top 调用方/引用方) |
 | `unity_stats`      | 图谱统计:规模、UnityEvent 数、调用边置信度分布、guid 来源                           |
 | `unity_rebuild`    | 全量重建图谱(`admin/full` profile)                                     |
 | `unity_update`     | **增量更新**:改了几个文件后只重建它们(秒级),支持修改/新增/删除                            |
@@ -251,7 +252,22 @@ MCP 查询不会隐式触发全量建图。首次使用先显式运行 `build`;�
 这个方法曾发现过「刷新占七成、refs/components 零调用」的真实问题,现在是
 一条命令的事。
 
+## 定位:AI × Unity 工具链的三层边界
+
+Unity 开发中的 AI 工具按「AI 看的是什么」分三层,本框架只做第一层:
+
+| 层 | 看的是什么 | 归属 | 状态 |
+|---|---|---|---|
+| **磁盘静态图** | 代码 + 序列化资产(离线、可缓存) | **unity-llm-graph**(本仓库) | 成熟 |
+| **编辑器会话** | 场景/prefab 实时读写、编译、控制台 | Editor MCP(MCP for Unity 等) | 用现成开源 |
+| **运行时会话** | Play Mode / 真机日志流、Play 冒烟 | 独立项目(unity-runtime-llm) | 规划中 |
+
+三层互补不重叠:查询找本框架,改东西找 Editor MCP,运行时观测找 runtime 层。
+`unity_error_report` 是三层的桥:输入一段运行时堆栈(第三层产出),用静态图
+(第一层)解释它从哪来、炸到谁。
+
 ## 让模型真的用上它(重要)
+
 
 装好 MCP 只是让工具**可用**,不等于会被调用。新开一个对话时,进模型上下文的
 只有当前 profile 的工具名 + 描述,图谱内容一条都不读。模型什么时候调,取决于
@@ -461,7 +477,7 @@ python tests/run_tests.py
 悬空引用体检、上下文打包、MCP 握手与 `tools/call`、**增量更新(改/增/删)**
 并覆盖 partial、namespace 重名、原子 build、tombstone、MCP profile 和严格
 token 预算,以及 **stale 检测(磁盘变更告警/老库降级)、digest 聚合、usage
-采用率报告**。共 **186 项断言 / 31 个测试组**。
+采用率报告**。共 **191 项断言 / 32 个测试组**。
 
 ## 能力与局限(诚实声明)
 
@@ -480,6 +496,22 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
 
 ## Changelog
+
+### 0.9.0
+
+主题:把运行时错误接进静态图 + 明确工具链边界。
+
+- **`error-report` / `unity_error_report`(错误现场打包)**:贴一段 Unity 堆栈
+  (Console 右键复制 / logcat 原文,支持 Console / .NET / IL2CPP 三种格式),
+  解析出涉事的用户代码类型(引擎帧/生成代码自动过滤),逐个 resolve 进图谱,
+  每个类型返回迷你影响面(top 调用方 + 资产引用计数 + stale 检查)。
+  把「贴日志 → AI 猜 → 来回问」压成一次调用。CLI 支持 `--file` / stdin 管道。
+- **三层边界声明**:README 新增「AI × Unity 工具链」定位表 —— 磁盘静态图
+  (本框架)/ 编辑器会话(Editor MCP)/ 运行时会话(独立项目),三层互补
+  不重叠,`error-report` 是运行时层到静态图的桥。
+- **文档脱敏**:`docs/visual_assets_extension.md` 与 README 中残留的真实项目
+  资产名替换为合成名,实测数据统一为「某项目」表述。
+- 测试 186 → **191 项断言 / 32 组**。
 
 ### 0.8.0
 
@@ -525,10 +557,10 @@ Timeline / Animator 资产录入补全(视觉资产扩展 Phase 1 收口,详见
 - **Animator 分层 + 默认态**:`animator_states` 加 `layer` / `is_default`,子状态机写成
   `层名/子机名` 路径;`animator_transitions` 加 `layer`,AnyState 转移 from 为空。
 - **Timeline 轨道嵌套**:GroupTrack 的 `m_Children` 还原成 `parent_fileid`
-  (实测 `Gacha_tenTimeline` 52 轨中 41 轨有父轨),`unity_timeline` 输出 `parent`。
-- **clip 类型**:`timeline_clips.asset_kind` 记 PlayableAsset 的脚本 guid。实测 318 个 clip
+  (实测某大型 Timeline 52 轨中 41 轨有父轨),`unity_timeline` 输出 `parent`。
+- **clip 类型**:`timeline_clips.asset_kind` 记 PlayableAsset 的脚本 guid。实测某项目 318 个 clip
   里 277 个播的是内联录制动画(没有外部 guid),只有这一列能说明这条 clip 是什么。
-- **非 ASCII 名字解码**:Unity 把中文名写成 `"骨架|Idle"`,入库前解码(真实项目 11 行受影响)。
+- **非 ASCII 名字解码**:Unity 把中文名写成 `"骨架|Idle"`,入库前解码(实测某项目 11 行受影响)。
 - **修增量更新丢数据**:`update_files` 以前既不重解析 `.controller`/`.playable` 的文件内结构,
   也不删旧行 —— 改过的动画资产会留脏行或整段丢失。已修 + 回归测试覆盖。
 - 老库自动 `ALTER TABLE` 补上述 5 列,不需要全量重建。
@@ -659,7 +691,7 @@ fileID 对象图:
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 186 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 191 项断言全绿。
 
 历次模型评审记录见 [REVIEWS.md](REVIEWS.md)(Kimi k3 / Claude Opus 5 /
 Cursor Grok 4.6 / GPT-5.6 Sol)。下一轮请对着真实项目和 `calls.log` 审,

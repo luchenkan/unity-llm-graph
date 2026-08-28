@@ -1026,6 +1026,42 @@ def test_usage():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_error_report():
+    print("[32] error-report(错误现场打包)")
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="unity_llm_test_")
+    try:
+        dst = os.path.join(tmp, "Proj")
+        shutil.copytree(FIXTURE, dst, ignore=shutil.ignore_patterns(".unity-llm"))
+        graph.build(dst)
+        stack = (
+            "NullReferenceException: Object reference not set to an instance of an object\n"
+            "Game.Combat.Player.TakeDamage () (at Assets/Scripts/Player.cs:42)\n"
+            "Game.EnemyAI.Refresh () (at Assets/Scripts/Enemy.cs:20)\n"
+            "UnityEngine.MonoBehaviour.Run () (at Library/Bee/artifacts/200b0aE.dag/X.cs:1)\n"
+        )
+        r = queries.error_report(dst, stack)
+        check("异常类型抽取",
+              r["exception"] == "NullReferenceException", str(r["exception"]))
+        check("引擎帧被过滤、用户帧保留",
+              len(r["frames"]) == 2
+              and r["frames"][0]["owner"] == "Game.Combat.Player"
+              and r["frames"][0]["line"] == 42, str(r["frames"]))
+        check("涉事类型进入影响面报告",
+              len(r["reports"]) >= 1
+              and "Player" in r["reports"][0]["target"], str(r["reports"]))
+        check(".NET 风格帧也能解析",
+              queries.error_report(
+                  dst,
+                  "at Game.Combat.Player.Attack() in Assets/Scripts/Player.cs:line 88"
+              )["frames"][0]["line"] == 88)
+        r2 = queries.error_report(dst, "随便一段没有堆栈的文字")
+        check("无堆栈时给人话提示", "hint" in r2, str(r2))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1042,7 +1078,7 @@ def main():
              test_correctness_hardening, test_atomic_build, test_hierarchy,
              test_build_progress, test_visual_assets,
              test_visual_query_end_to_end,
-             test_stale_detection, test_digest, test_usage]
+             test_stale_detection, test_digest, test_usage, test_error_report]
     failed = 0
     for t in tests:
         try:

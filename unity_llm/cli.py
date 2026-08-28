@@ -11,6 +11,7 @@
     python -m unity_llm context    --project ... --target Enemy --budget 1500
     python -m unity_llm digest     --project ... --files -        # stdin: 变更文件列表
     python -m unity_llm usage      --project ...                  # MCP 工具采用率
+    python -m unity_llm error-report --project ... --file crash.log
     python -m unity_llm serve      --project ...      # MCP stdio server
     python -m unity_llm init-config                   # 生成各客户端 MCP 配置示例
 """
@@ -119,6 +120,19 @@ def cmd_digest(args) -> int:
 
 def cmd_usage(args) -> int:
     _print(args, queries.usage_report(_project(args)))
+    return 0
+
+
+def cmd_error_report(args) -> int:
+    text = args.text
+    if args.file:
+        with open(args.file, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    elif text in (None, "-"):
+        text = sys.stdin.read()
+    _print(args, queries.error_report(_project(args), text,
+                                      limit=args.limit,
+                                      impact_limit=args.impact_limit))
     return 0
 
 
@@ -297,6 +311,21 @@ def build_parser() -> argparse.ArgumentParser:
                              "在用哪些工具、图谱有没有被消费")
     add_project(sp)
     sp.set_defaults(func=cmd_usage)
+
+    sp = sub.add_parser("error-report",
+                        help="错误现场打包:贴一段 Unity 堆栈,返回每个涉事"
+                             "类型的迷你影响面(top 调用方/引用方)")
+    add_project(sp)
+    sp.add_argument("--text", default=None,
+                    help="错误文本;传 '-' 或省略则从 stdin 读(Unity Console"
+                         " 右键复制 / logcat 原文直接管道进来)")
+    sp.add_argument("--file", default=None,
+                    help="从日志文件读,如 --file crash.log")
+    sp.add_argument("--limit", type=int, default=5,
+                    help="最多分析的堆栈类型数,默认 5")
+    sp.add_argument("--impact-limit", type=int, default=6,
+                    help="每个类型的 top 调用方条数,默认 6")
+    sp.set_defaults(func=cmd_error_report)
 
     sp = sub.add_parser("context", help="为目标生成 token 预算内的 LLM 上下文包")
     add_project(sp)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Dict, List, Optional, Set
 
 from .graph import (connect, has_graph, build_command as graph_build_command,
@@ -1198,9 +1199,9 @@ def digest(project_root: str, files: List[str], limit: int = 12) -> Dict:
     return out
 
 
-# core profile 的五个日常查询工具;usage 报告里拿它们做「零调用」告警
+# core profile 的日常查询工具;usage 报告里拿它们做「零调用」告警
 CORE_TOOLS = ("unity_impact", "unity_refs", "unity_components",
-              "unity_find", "unity_context")
+              "unity_find", "unity_context", "unity_error_report")
 
 
 def usage_report(project_root: str) -> Dict:
@@ -1263,6 +1264,85 @@ def usage_report(project_root: str) -> Dict:
     if total["calls"] and conn_tool_calls == 0:
         out["hint"] = ("全部调用都是 unity_update(图谱刷新),没有任何查询 —— "
                        "图谱在被维护,没被消费")
+    return out
+
+
+# 堆栈帧解析:覆盖 Unity Console / .NET / IL2CPP 三种常见格式,宁缺毋滥 ——
+# 解析不出的帧直接跳过,绝不拿半截字符串去猜类型。
+_STACK_FRAME_RES = (
+    # ... Method () (at Assets/.../File.cs:120)     —— Unity Console
+    re.compile(r"([A-Za-z_][\w.]*)\.([A-Za-z_][\w`]*)\s*\([^)]*\)"
+               r"\s*\(at\s+(.+?\.cs):(\d+)\)"),
+    # at Namespace.Type.Method(...) in File.cs:line 120 —— .NET / mono
+    re.compile(r"at\s+([A-Za-z_][\w.]*)\.([A-Za-z_][\w`]*)[^(\n]*"
+               r"\([^)]*\)\s+in\s+(.+?\.cs):line\s+(\d+)"),
+    # Method() [0x00000] in File.cs:120 —— IL2CPP
+    re.compile(r"([A-Za-z_][\w.]*)\.([A-Za-z_][\w`]*)[^(\n]*\([^)]*\)"
+               r"\s*\[0x[0-9a-fA-F]+\]\s+in\s+(.+?\.cs):(\d+)"),
+)
+_EXCEPTION_RE = re.compile(r"^\s*([A-Za-z_]\w*(?:Exception|Error))\s*[:：]\s*(.*)")
+_ENGINE_NS = ("UnityEngine", "System", "TMPro", "I2", "Cysharp", "DG")
+
+
+def error_report(project_root: str, error_text: str,
+                 limit: int = 5, impact_limit: int = 6) -> Dict:
+    """错误现场打包:一段堆栈进图,每个涉事类型回一份迷你影响面。
+
+    把「贴日志 → AI 猜 → 来回问」压成一次调用:解析堆栈帧里的用户代码
+    类型,逐个 resolve 进图谱并取 top 调用方/引用方,AI 拿到就能直接
+    判断「这个空引用可能从哪来、炸到谁」。
+    """
+    conn = connect(project_root)
+    out: Dict = {"exception": None, "message": "", "frames": [],
+                 "reports": [], "unresolved": []}
+    lines = error_text.splitlines() if error_text else []
+    for ln in lines:
+        if not out["exception"]:
+            m = _EXCEPTION_RE.match(ln)
+            if m:
+                out["exception"] = m.group(1)
+                out["message"] = m.group(2).strip()[:200]
+                continue
+        for pat in _STACK_FRAME_RES:
+            m = pat.search(ln)
+            if m:
+                owner, method, file, line = (m.group(1), m.group(2),
+                                             m.group(3).replace("\\", "/"),
+                                             int(m.group(4)))
+                # 只关心用户代码:引擎命名空间、生成代码、库目录直接跳过
+                if owner.split(".")[0] in _ENGINE_NS or "Library/" in file:
+                    break
+                out["frames"].append({"owner": owner, "method": method,
+                                      "file": file, "line": line})
+                break
+    # 同类型多帧合并,保持堆栈顺序
+    ordered: List[Dict] = []
+    seen_owners: Set[str] = set()
+    for f in out["frames"]:
+        if f["owner"] not in seen_owners:
+            seen_owners.add(f["owner"])
+            ordered.append(f)
+    for f in ordered[:limit]:
+        node = resolve_target(conn, f["owner"])
+        if node.get("kind") not in ("type", "asset"):
+            out["unresolved"].append(f["owner"])
+            continue
+        imp = impact(project_root, node.get("full_name") or node.get("path"),
+                     depth=1, limit=impact_limit)
+        out["reports"].append({
+            "target": f["owner"],
+            "resolved": _present_node(imp.get("resolved", {})),
+            "graph_stale": imp.get("graph_stale"),
+            "top_callers": [
+                {"caller": c["caller"], "at": c["at"], "via": c["via"]}
+                for c in imp.get("code_dependents", [])[:impact_limit]],
+            "asset_dependents_count":
+                imp.get("summary", {}).get("asset_dependents", 0),
+        })
+    if not out["frames"] and not out["exception"]:
+        out["hint"] = ("没解析出任何堆栈帧/异常类型 —— 确认贴的是完整堆栈"
+                       "(Unity Console 右键复制 / logcat 原文)")
+    conn.close()
     return out
 
 

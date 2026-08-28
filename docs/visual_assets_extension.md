@@ -26,7 +26,7 @@
 | `.anim`(clip) | `script -> .cs`、`value -> 贴图` | ✅ clip→目标组件 有了 |
 | `.playable`(Timeline) | 只有 `m_Script -> track 脚本` | ⚠️ 只有 track 类型，没有 clip 内容/时序/绑定 |
 | `.shadergraph` | **无**（294 个资产 0 条边） | ❌ 未解析（是 JSON，不是 YAML） |
-| `.vfx` | **无**（本项目 0 个） | ❌ 未解析 |
+| `.vfx` | **无**（实测项目 0 个） | ❌ 未解析 |
 
 **根因**：现在的 `parse_unity_yaml` 只抽**跨资产 guid 边**（`{fileID, guid}`），
 内部结构是靠 `fileID` 互相引用的（`{fileID: X}` 无 guid），而 parser 明确把这部分 `continue` 掉了
@@ -37,7 +37,7 @@
 
 ## 二、真实 YAML 结构（已读文件验证，这是接下来要解析的东西）
 
-### AnimatorController（`battle_cut_in_tshh.controller` 实测）
+### AnimatorController（`hero_cut_in.controller` 实测,合成名）
 
 ```
 !u!91  AnimatorController
@@ -57,7 +57,7 @@
 
 → 要补的是：`Controller → Layer → StateMachine → (ChildStates / DefaultState) → State → (Motion / Transitions → DestinationState)` 这条**内部 fileID 链**，以及 `m_Conditions`（参数名 + 比较符 + 阈值）。
 
-### Timeline（`timeline_weapon_wujinjiuhu.playable` 实测）
+### Timeline（`timeline_weapon.playable` 实测,合成名）
 
 ```
 !u!114 MonoBehaviour  (m_Script = TimelineAsset.cs)      ← 根
@@ -113,9 +113,9 @@
 | Animator 层 | 每个 layer 名，state 属于哪层，子状态机写成 `层名/子机名` 路径 | `animator_states.layer` |
 | Animator 默认态 | layer / 子状态机的 `m_DefaultState` | `animator_states.is_default` |
 | Animator 转移 | from/to + 条件（参数名、`m_ConditionMode`、阈值）+ 所在层；AnyState 转移 from 为空 | `animator_transitions.layer` |
-| Timeline 轨道嵌套 | GroupTrack 的 `m_Children` 还原成父子（实测 `Gacha_tenTimeline` 52 轨里 41 轨有父） | `timeline_tracks.parent_fileid` |
-| Timeline clip 类型 | clip 的 PlayableAsset 的 `m_Script` guid，用来区分 Animation/Control/Activation clip。**关键**：实测 318 个 clip 里 277 个播的是内联录制动画（没有外部 guid），只有这一列能说明它是什么 | `timeline_clips.asset_kind` |
-| 名字可读性 | Unity 把非 ASCII 名写成 `"骨架|Idle"`，入库前解码（实测真实项目 11 行受影响） | 全部 name 列 |
+| Timeline 轨道嵌套 | GroupTrack 的 `m_Children` 还原成父子（实测某大型 Timeline 52 轨里 41 轨有父） | `timeline_tracks.parent_fileid` |
+| Timeline clip 类型 | clip 的 PlayableAsset 的 `m_Script` guid，用来区分 Animation/Control/Activation clip。**关键**：实测某项目 318 个 clip 里 277 个播的是内联录制动画（没有外部 guid），只有这一列能说明它是什么 | `timeline_clips.asset_kind` |
+| 名字可读性 | Unity 把非 ASCII 名写成 `"骨架|Idle"`，入库前解码（实测某项目 11 行受影响） | 全部 name 列 |
 | 增量刷新 | `update_files` 之前既不重解析视觉结构、也不删旧行 → `.controller`/`.playable` 增量更新会丢数据或留脏行。已修 + 回归测试覆盖 | `graph.update_files` |
 
 老库自动 `ALTER TABLE` 补这 5 列，不用重建。
@@ -146,9 +146,9 @@
       Unity 各版本枚举值不保证一致，映射错比不映射更坏。
 - [ ] Timeline 的 `m_Binding` / PlayableDirector 的场景绑定**仍未捕获** —— 现在能说出「有哪几条 track、
       clip 在什么时间段、播的是什么类型」，但说不出「这条 track 绑的是场景里哪个物体」。是 Phase 1 的已知缺口。
-- [ ] `parse_shadergraph` 在真实项目 294 个 `.shadergraph` 上**产出 0 行**：真实 ShaderGraph JSON 用
+- [ ] `parse_shadergraph` 在某 4 万资产项目的 294 个 `.shadergraph` 上**产出 0 行**：真实 ShaderGraph JSON 用
       `m_ObjectId` 引用块，不是设计时假设的 `m_SubGraphs`。Phase 2 要按真实格式重写。
-- [ ] `.vfx` 解析**未验证**（本项目 0 个资产）。
+- [ ] `.vfx` 解析**未验证**（实测项目 0 个资产）。
 - [ ] 写侧 Timeline 需要 Unity 编辑器里真机验证（`TimelineAsset` API 的 `CreateClip` 签名在 Unity 6 是否有变）。
 
 ---
