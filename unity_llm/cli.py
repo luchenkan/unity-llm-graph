@@ -99,13 +99,18 @@ def cmd_validate(args) -> int:
 
 
 def cmd_update(args) -> int:
-    _print(args, graph.update_files(_project(args), _read_files_arg(args)))
+    files = _read_files_arg(args)
+    stale = bool(getattr(args, "stale", False)) or not files
+    if stale:
+        _print(args, graph.heal_stale(_project(args), extra_paths=files or None))
+    else:
+        _print(args, graph.update_files(_project(args), files))
     return 0
 
 
 def _read_files_arg(args) -> list:
     """--files 支持 '-' 从 stdin 读(每行一个路径),方便接 git diff 管道。"""
-    files = args.files
+    files = getattr(args, "files", None) or []
     if files == ["-"]:
         files = [ln.strip() for ln in sys.stdin
                  if ln.strip() and not ln.strip().startswith("#")]
@@ -289,11 +294,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_limit(sp)
     sp.set_defaults(func=cmd_validate)
 
-    sp = sub.add_parser("update", help="增量更新:只重建指定文件(日常改代码后用)")
+    sp = sub.add_parser("update", help="增量更新:指定文件,或 --stale 只补图谱与磁盘不一致的文件")
     add_project(sp)
-    sp.add_argument("--files", nargs="+", required=True,
+    sp.add_argument("--files", nargs="*", default=None,
                     help="项目相对路径,如 Assets/Scripts/Enemy.cs;"
+                         "省略(且不带 --files)时等同 --stale;"
                          "传 '-' 则从 stdin 读(每行一个路径);文件已删除则清除其图数据")
+    sp.add_argument("--stale", action="store_true",
+                    help="扫描 file_state,只刷新与磁盘不一致(含已删除)的文件。"
+                         "可与 --files 同时用(并集)。hook 漏刷时用这个,不必全量 build")
     sp.set_defaults(func=cmd_update)
 
     sp = sub.add_parser("digest",

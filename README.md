@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-191%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-193%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / methods / calls / inheritance / engine lifecycle callbacks)
@@ -234,17 +234,18 @@ python -m unity_llm context --project /path/to/Proj --target Enemy --budget 1500
 | `unity_error_report` | **错误现场打包**:贴一段 Unity 堆栈,返回每个涉事类型的迷你影响面(top 调用方/引用方) |
 | `unity_stats`      | 图谱统计:规模、UnityEvent 数、调用边置信度分布、guid 来源                           |
 | `unity_rebuild`    | 全量重建图谱(`admin/full` profile)                                     |
-| `unity_update`     | **增量更新**:改了几个文件后只重建它们(秒级),支持修改/新增/删除                            |
+| `unity_update`     | **增量更新**:给 paths 只重建这些文件;不传 paths 则只补与磁盘不一致的文件(hook 漏刷自愈) |
 
 MCP 查询不会隐式触发全量建图。首次使用先显式运行 `build`;中型项目大约 8-10 分钟,
 期间 stderr 有进度输出,避免看起来像卡住。`rebuild` 只在 `admin/full` profile 暴露。
 
-**图谱过期自动告警(stale 检测)**:增量更新靠 git hook 后台跑且静默失败,挂掉时
-图谱会悄悄冻结,之后每次查询都在旧结构上给出自信的错答案 —— 这是最危险的失败
-模式。0.8.0 起建图/更新会记录每个收录文件的 mtime/size(`file_state` 表),
-`impact / refs / components / animator / timeline` 查询时校验目标文件:
-发现磁盘版本变了,返回体里会出现 `graph_stale: {warning, files}`,提醒先
-`update` 再下结论。老库没有这张表时静默降级,不报错也不误报。
+**图谱过期自愈(stale → 小更新)**:增量更新靠 git hook 后台跑且静默失败,挂掉时
+图谱会悄悄冻结。0.8.0 起建图/更新会记录每个收录文件的 mtime/size(`file_state`),
+查询时校验目标文件。**0.9.1 起对不上不再只告警**:`impact / refs / components /
+animator / timeline` 会按这些文件做一次增量 `update`,结果带 `graph_healed`;
+补不齐才留 `graph_stale`。也可主动 `unity-llm update --stale`(MCP 的
+`unity_update` 不传 paths 等同)。新文件从未进过图谱的不在 `file_state` 里,
+仍需 hook 的 `--files` 或全量 `build`。老库没有这张表时静默降级,不误报。
 
 **采用率度量**:`python -m unity_llm usage` 把 `.unity-llm/calls.log` 聚合成
 工具直方图:每个工具的调用次数/token/错误、`unity_update` 刷新占比、core
@@ -274,7 +275,8 @@ Unity 开发中的 AI 工具按「AI 看的是什么」分三层,本框架只做
 你的问法能不能撞上工具描述 —— 问「改 X 会影响谁」大概率会调,问
 「这个按钮点了没反应」它可能先去 grep。
 
-同理,**改完文件不会自动刷新图谱**:`unity_update` 也得有人调。
+同理,**改完文件默认交给 hook**;查询若发现目标文件已漂,会按文件增量补齐,
+不必在会话里例行调 `unity_update`。主动扫全库漂移用 `update --stale`。
 
 所以要把「可用」变成「默认动作」,以下三档任选:
 
@@ -321,11 +323,15 @@ UNITY_LLM_DIR="/path/to/unity-llm-graph"   # 框架仓库路径
 ROOT=$(git rev-parse --show-toplevel)
 [ -f "$ROOT/.unity-llm/graph.db" ] || exit 0   # 没建过图就不管
 FILES=$(git diff-tree --no-commit-id --name-only -r HEAD \
-        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$')
-[ -z "$FILES" ] && exit 0
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$' || true)
 cd "$UNITY_LLM_DIR" || exit 0
-python -m unity_llm update --project "$ROOT" --files $FILES \
-    >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+if [ -n "$FILES" ]; then
+  python -m unity_llm update --project "$ROOT" --stale --files $FILES \
+      >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+else
+  python -m unity_llm update --project "$ROOT" --stale \
+      >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+fi
 exit 0
 ```
 
@@ -419,6 +425,8 @@ python -m unity_llm validate    --project P [--limit 60]
 python -m unity_llm update      --project P --files Assets/Scripts/Enemy.cs [...]
                                  # 增量更新指定文件(秒级);文件已删除则清除其数据
                                  # --files - 可从 stdin 读(接 git diff 管道)
+                                 # --stale 只补 file_state 与磁盘不一致的文件
+                                 # 不传 --files 等同 --stale(hook 漏刷自愈,不必 rebuild)
 python -m unity_llm digest     --project P --files Assets/... [...]
                                  # 一批变更文件的影响面摘要:调用方/引用方/挂载点 top 榜
                                  # pull / code review 后先看波及谁再决定细查哪
@@ -476,8 +484,8 @@ python tests/run_tests.py
 死代码误报控制、**方法组引用(`method_ref`)**、**解析器注释/字符串遮蔽回归**、
 悬空引用体检、上下文打包、MCP 握手与 `tools/call`、**增量更新(改/增/删)**
 并覆盖 partial、namespace 重名、原子 build、tombstone、MCP profile 和严格
-token 预算,以及 **stale 检测(磁盘变更告警/老库降级)、digest 聚合、usage
-采用率报告**。共 **191 项断言 / 32 个测试组**。
+token 预算,以及 **stale 检测(磁盘变更自愈/老库降级)、digest 聚合、usage
+采用率报告**。共 **193 项断言 / 32 个测试组**。
 
 ## 能力与局限(诚实声明)
 
@@ -496,6 +504,20 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
 
 ## Changelog
+
+### 0.9.1
+
+主题:hook / git 漏刷时,图谱与磁盘对不上就按文件增量补齐,不必 rebuild。
+
+- **查询期自愈**:`impact / refs / components / animator / timeline` 发现
+  目标文件 `file_state` 与磁盘不一致时,只 `update` 这些文件再查。成功带
+  `graph_healed`,失败才留 `graph_stale`。
+- **`update --stale`**:扫全表漂移(含磁盘已删)。不传 `--files` 等同 `--stale`。
+  可与 `--files` 并集,用来收从未进过图谱的新资产。
+- **MCP `unity_update`**:`paths` 改为可选;省略则 `heal_stale`。
+- **git hook 模板**:post-commit / post-merge / post-rewrite 在提交文件之外
+  加 `--stale`,空 diff 不再直接退出。
+- 测试 191 → **193 项断言 / 32 组**。
 
 ### 0.9.0
 
@@ -675,7 +697,8 @@ fileID 对象图:
       PostToolUse hook(`tools/hook_post_edit.py`)
 - [x] pull / merge / rebase 拉取后自动增量更新(`tools/post-merge.sample` /
       `tools/post-rewrite.sample`)
-- [x] 图谱新鲜度自验证(查询期 stale 告警,`file_state` 表)+ 多文件影响面
+- [x] 图谱新鲜度自验证(查询期 stale 告警,`file_state` 表)+ 不一致时按文件
+      增量自愈(`update --stale` / 查询 `graph_healed`)+ 多文件影响面
       摘要(`digest`)+ 采用率度量(`usage`)
 - [x] 链式静态字段调用(`Type.Field.Method()`,含事件总线 / 单例)
 - [ ] 文件监听 daemon(免 hook,编辑器里手改也实时跟)
@@ -691,7 +714,7 @@ fileID 对象图:
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 191 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 193 项断言全绿。
 
 历次模型评审记录见 [REVIEWS.md](REVIEWS.md)(Kimi k3 / Claude Opus 5 /
 Cursor Grok 4.6 / GPT-5.6 Sol)。下一轮请对着真实项目和 `calls.log` 审,

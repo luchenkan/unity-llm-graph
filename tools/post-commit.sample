@@ -16,11 +16,17 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 [ -f "$ROOT/.unity-llm/graph.db" ] || exit 0   # 没建过图就不管
 
 FILES=$(git diff-tree --no-commit-id --name-only -r HEAD \
-        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$')
-[ -z "$FILES" ] && exit 0
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$' || true)
 
 cd "$UNITY_LLM_DIR" 2>/dev/null || exit 0
-python -m unity_llm update --project "$ROOT" --files $FILES \
-    >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+# --stale 补上一次 hook 静默失败/手改未进 git 的漂移;
+# --files 把本次提交里尚未进 file_state 的新资产收进来。
+if [ -n "$FILES" ]; then
+    python -m unity_llm update --project "$ROOT" --stale --files $FILES \
+        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+else
+    python -m unity_llm update --project "$ROOT" --stale \
+        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+fi
 
 exit 0

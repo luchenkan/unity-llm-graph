@@ -14,7 +14,8 @@
 # diff ORIG_HEAD..HEAD 就是本次拉入的变更文件。
 # git worktree:hook 目录是多个 worktree 共享的,这里用 --show-toplevel
 # 动态取当前项目根,所以每个 worktree 各自更新自己的图谱。
-# 后台执行 + 静默失败,永不阻塞 pull。已是最新(无变化)时 diff 为空,直接退出。
+# 后台执行 + 静默失败,永不阻塞 pull。无 cs/prefab 变化时仍跑 --stale,
+# 用来补上一次漏刷。
 
 UNITY_LLM_DIR="/c/Users/you/unity-llm-graph"
 
@@ -24,11 +25,15 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 BASE=$(git rev-parse ORIG_HEAD 2>/dev/null) || exit 0
 
 FILES=$(git diff --name-only "$BASE" HEAD \
-        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$')
-[ -z "$FILES" ] && exit 0
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$' || true)
 
 cd "$UNITY_LLM_DIR" 2>/dev/null || exit 0
-python -m unity_llm update --project "$ROOT" --files $FILES \
-    >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+if [ -n "$FILES" ]; then
+    python -m unity_llm update --project "$ROOT" --stale --files $FILES \
+        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+else
+    python -m unity_llm update --project "$ROOT" --stale \
+        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+fi
 
 exit 0

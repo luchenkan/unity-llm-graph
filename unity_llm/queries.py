@@ -16,7 +16,7 @@ import re
 from typing import Dict, List, Optional, Set
 
 from .graph import (connect, has_graph, build_command as graph_build_command,
-                    check_stale)
+                    check_stale, update_files)
 from .unity_yaml import CLASS_NAMES
 
 DEFAULT_LIMIT = 60
@@ -306,10 +306,42 @@ def _stale_field(conn, project_root: str, node: Dict) -> Optional[Dict]:
     if not stale:
         return None
     return {
-        "warning": "目标文件在图谱收录后被改过(mtime 不一致),以下结论可能"
-                   "基于旧结构;先 unity_update 这几个文件再下判断",
+        "warning": "目标文件在图谱收录后被改过,增量补齐后仍不一致;"
+                   "可 unity_update --stale 或 unity_rebuild",
         "files": stale,
     }
+
+
+def _apply_stale(out: Dict, conn, project_root: str, target: str, node: Dict):
+    """图谱与磁盘对不上时,只增量重建这些文件再重查。hook 漏刷时查询仍正确。
+
+    补齐失败才在 out 里留 graph_stale;成功则带 graph_healed。
+    """
+    stale = _stale_field(conn, project_root, node)
+    if not stale:
+        return conn, node
+    paths = [f["path"] for f in stale["files"] if f.get("path")]
+    if not paths:
+        out["graph_stale"] = stale
+        return conn, node
+    conn.close()
+    result = update_files(project_root, paths)
+    healed = {
+        "updated": result.get("updated") or [],
+        "deleted": result.get("deleted") or [],
+        "seconds": result.get("seconds"),
+        "reason": "目标文件与图谱不一致(git hook 漏刷或磁盘未跟踪改动),已按文件增量补齐",
+    }
+    if result.get("errors"):
+        healed["errors"] = result["errors"]
+    out["graph_healed"] = healed
+    conn = connect(project_root)
+    node = resolve_target(conn, target)
+    out["resolved"] = _present_node(node)
+    still = _stale_field(conn, project_root, node)
+    if still:
+        out["graph_stale"] = still
+    return conn, node
 
 
 def impact(project_root: str, target: str, depth: int = 3,
@@ -332,9 +364,11 @@ def impact(project_root: str, target: str, depth: int = 3,
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
-    stale = _stale_field(conn, project_root, node)
-    if stale:
-        out["graph_stale"] = stale
+    conn, node = _apply_stale(out, conn, project_root, target, node)
+    if node["kind"] not in ("asset", "type", "method", "field"):
+        conn.close()
+        out["hint"] = out.get("hint") or _unresolved_hint(node)
+        return out
 
     owners, names, guids, short = _type_scope(conn, node)
     confs = GOOD_CONF + ("low",) if include_low else GOOD_CONF
@@ -490,9 +524,11 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
-    stale = _stale_field(conn, project_root, node)
-    if stale:
-        out["graph_stale"] = stale
+    conn, node = _apply_stale(out, conn, project_root, target, node)
+    if node["kind"] not in ("asset", "type", "method", "field"):
+        conn.close()
+        out["hint"] = out.get("hint") or _unresolved_hint(node)
+        return out
     owners, names, guids, short = _type_scope(conn, node)
     confs = GOOD_CONF + ("low",) if include_low else GOOD_CONF
     conf_marks = ",".join("?" * len(confs))
@@ -638,9 +674,11 @@ def components(project_root: str, target: str,
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
-    stale = _stale_field(conn, project_root, node)
-    if stale:
-        out["graph_stale"] = stale
+    conn, node = _apply_stale(out, conn, project_root, target, node)
+    if node["kind"] not in ("asset", "type", "method", "field"):
+        conn.close()
+        out["hint"] = out.get("hint") or _unresolved_hint(node)
+        return out
     if node["kind"] == "asset" and node["ext"] in (".prefab", ".unity"):
         rows = conn.execute(
             "SELECT DISTINCT r.dst_guid g, r.context ctx, a.path p FROM refs r"
@@ -718,9 +756,11 @@ def animator(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict
         conn.close()
         out["hint"] = "图谱缺 animator_states 表,请重新 build"
         return out
-    stale = _stale_field(conn, project_root, node)
-    if stale:
-        out["graph_stale"] = stale
+    conn, node = _apply_stale(out, conn, project_root, target, node)
+    if node.get("kind") != "asset" or node.get("ext") != ".controller":
+        conn.close()
+        out["hint"] = out.get("hint") or _unresolved_hint(node)
+        return out
     guid = node["guid"]
     st_cols = _cols(conn, "animator_states")
     lyr = "layer" if "layer" in st_cols else "'' AS layer"
@@ -775,9 +815,11 @@ def timeline(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict
         conn.close()
         out["hint"] = "图谱缺 timeline_tracks 表,请重新 build"
         return out
-    stale = _stale_field(conn, project_root, node)
-    if stale:
-        out["graph_stale"] = stale
+    conn, node = _apply_stale(out, conn, project_root, target, node)
+    if node.get("kind") != "asset" or node.get("ext") != ".playable":
+        conn.close()
+        out["hint"] = out.get("hint") or _unresolved_hint(node)
+        return out
     guid = node["guid"]
     tk_cols = _cols(conn, "timeline_tracks")
     par = "parent_fileid" if "parent_fileid" in tk_cols else "'' AS parent_fileid"
@@ -1332,6 +1374,7 @@ def error_report(project_root: str, error_text: str,
         out["reports"].append({
             "target": f["owner"],
             "resolved": _present_node(imp.get("resolved", {})),
+            "graph_healed": imp.get("graph_healed"),
             "graph_stale": imp.get("graph_stale"),
             "top_callers": [
                 {"caller": c["caller"], "at": c["at"], "via": c["via"]}

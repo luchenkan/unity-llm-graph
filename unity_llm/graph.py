@@ -859,13 +859,85 @@ def check_stale(conn, project_root: str, rel_paths, limit: int = 5) -> List[Dict
         try:
             st = os.stat(disk)
         except OSError:
-            continue  # 磁盘上没了但图里还在?update 删除路径会清;这里不管
+            out.append({"path": r["path"],
+                        "graph_at": int(r["mtime"]),
+                        "disk_at": 0})
+            if len(out) >= limit:
+                break
+            continue
         if abs(st.st_mtime - r["mtime"]) > 0.001 or st.st_size != r["size"]:
             out.append({"path": r["path"],
                         "graph_at": int(r["mtime"]),
                         "disk_at": int(st.st_mtime)})
             if len(out) >= limit:
                 break
+    return out
+
+
+def collect_stale(project_root: str, rel_paths=None, limit: int = 0) -> List[str]:
+    """file_state 里与磁盘不一致(改过或已删)的相对路径。rel_paths 为空则扫全表。
+
+    hook 漏刷 / 编辑器手改未进 git 时用这个列名单,再交给 update_files。
+    新文件从未进过图谱的不在 file_state 里,扫不出来,仍需 --files 或下次 build。
+    """
+    root = os.path.abspath(project_root)
+    conn = connect(root)
+    try:
+        if rel_paths:
+            paths = [p.replace("\\", "/").lstrip("/") for p in rel_paths if p]
+            if not paths:
+                return []
+            try:
+                rows = conn.execute(
+                    "SELECT path, mtime, size FROM file_state WHERE path IN"
+                    f" ({','.join('?' * len(paths))})", paths).fetchall()
+            except sqlite3.Error:
+                return []
+        else:
+            try:
+                rows = conn.execute(
+                    "SELECT path, mtime, size FROM file_state").fetchall()
+            except sqlite3.Error:
+                return []
+    finally:
+        conn.close()
+    out: List[str] = []
+    for r in rows:
+        disk = os.path.join(root, *r["path"].split("/"))
+        try:
+            st = os.stat(disk)
+        except OSError:
+            out.append(r["path"])
+            if limit and len(out) >= limit:
+                break
+            continue
+        if abs(st.st_mtime - r["mtime"]) > 0.001 or st.st_size != r["size"]:
+            out.append(r["path"])
+            if limit and len(out) >= limit:
+                break
+    return out
+
+
+def heal_stale(project_root: str, extra_paths=None, limit: int = 0) -> dict:
+    """只增量重建「对不上」的文件,并可选并上 extra_paths(本次 git 里的新文件)。
+
+    不全量 build。extra 里尚未进 file_state 的新资产靠这条进来;
+    drifted 覆盖 hook 静默失败后留下的旧节点。两者都空则秒退,不重跑调用边。
+    """
+    extra = [p.replace("\\", "/").lstrip("/") for p in (extra_paths or []) if p]
+    drifted = collect_stale(project_root, limit=limit)
+    paths: List[str] = []
+    seen = set()
+    for p in extra + drifted:
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+    if not paths:
+        return {"updated": [], "deleted": [], "errors": [],
+                "seconds": 0, "stale_found": 0, "healed": True}
+    out = update_files(project_root, paths)
+    out["stale_found"] = len(drifted)
+    out["healed"] = True
     return out
 
 

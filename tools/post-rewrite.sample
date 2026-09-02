@@ -23,11 +23,15 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 BASE=$(git rev-parse ORIG_HEAD 2>/dev/null) || exit 0
 
 FILES=$(git diff --name-only "$BASE" HEAD \
-        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$')
-[ -z "$FILES" ] && exit 0
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$' || true)
 
 cd "$UNITY_LLM_DIR" 2>/dev/null || exit 0
-python -m unity_llm update --project "$ROOT" --files $FILES \
-    >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+if [ -n "$FILES" ]; then
+    python -m unity_llm update --project "$ROOT" --stale --files $FILES \
+        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+else
+    python -m unity_llm update --project "$ROOT" --stale \
+        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+fi
 
 exit 0

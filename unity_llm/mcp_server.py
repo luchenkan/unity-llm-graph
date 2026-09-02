@@ -186,16 +186,16 @@ TOOLS = [
     },
     {
         "name": "unity_update",
-        "description": ("增量更新图谱:改了个别文件后调用,只重建这些文件(秒级)。"
-                        "传项目相对路径,如 Assets/Scripts/Enemy.cs。"
-                        "会话里也可不调,交给 git post-commit hook 批量刷新。"),
+        "description": ("增量更新图谱。给 paths 只重建这些文件;"
+                        "不传 paths 则扫描 file_state,只补与磁盘不一致的文件"
+                        "(git hook 漏刷时用,不必 rebuild)。"),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "paths": {"type": "array", "items": {"type": "string"},
-                          "description": "项目相对路径列表"},
+                          "description": "项目相对路径列表;省略则按 stale 自愈"},
             },
-            "required": ["paths"],
+            "required": [],
         },
     },
     {
@@ -387,12 +387,10 @@ def make_dispatcher(project_root: str,
                 impact_limit=int(args.get("impact_limit", 6)))
         elif name == "unity_update":
             paths = args.get("paths")
-            if not paths:
-                raise ValueError(
-                    "unity_update 需要 paths(项目相对路径列表),"
-                    "如 [\"Assets/Scripts/Enemy.cs\"]。"
-                    "会话内也可不调,交给 git post-commit hook。")
-            out = graph.update_files(project_root, list(paths))
+            if paths:
+                out = graph.update_files(project_root, list(paths))
+            else:
+                out = graph.heal_stale(project_root)
         else:
             # 带上可用工具清单,让模型一次自纠(实测发生过模型调用
             # profile 外工具、只拿到「未知工具」三个字后反复重试的浪费)

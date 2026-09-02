@@ -930,7 +930,7 @@ def test_visual_query_end_to_end():
 
 
 def test_stale_detection():
-    print("[29] stale 检测(图谱落后于磁盘时查询必须告警)")
+    print("[29] stale 检测(对不上则增量自愈;老库降级)")
     import shutil
     import tempfile
     tmp = tempfile.mkdtemp(prefix="unity_llm_test_")
@@ -939,22 +939,39 @@ def test_stale_detection():
         shutil.copytree(FIXTURE, dst, ignore=shutil.ignore_patterns(".unity-llm"))
         graph.build(dst)
         r = queries.impact(dst, "Enemy")
-        check("新鲜图谱不带 stale 告警", "graph_stale" not in r, str(r.get("graph_stale")))
+        check("新鲜图谱不带 stale/healed",
+              "graph_stale" not in r and "graph_healed" not in r,
+              str({k: r.get(k) for k in ("graph_stale", "graph_healed")}))
         # 改磁盘不改图:模拟 hook 挂掉 / pull 后还没刷
         enemy = os.path.join(dst, "Assets", "Scripts", "Enemy.cs")
+        player = os.path.join(dst, "Assets", "Scripts", "Player.cs")
         open(enemy, "a", encoding="utf-8").write("\n// touched\n")
         r2 = queries.impact(dst, "Enemy")
-        check("磁盘变过 -> impact 带 graph_stale",
-              "graph_stale" in r2
-              and any(x["path"].endswith("Enemy.cs")
-                      for x in r2["graph_stale"]["files"]), str(r2.get("graph_stale")))
+        check("磁盘变过 -> impact 自动增量补齐,不留 stale 告警",
+              "graph_stale" not in r2
+              and "graph_healed" in r2
+              and any(x.endswith("Enemy.cs")
+                      for x in r2["graph_healed"]["updated"]),
+              str(r2.get("graph_healed")))
         rr = queries.find_refs(dst, "Enemy")
-        check("refs 同样带 graph_stale", "graph_stale" in rr)
-        # update 之后告警消失
-        graph.update_files(dst, ["Assets/Scripts/Enemy.cs"])
+        check("refs 补齐后不再告 stale",
+              "graph_stale" not in rr, str(rr.get("graph_stale")))
+        # 再改两个文件,不经查询,走 --stale 扫描
+        open(enemy, "a", encoding="utf-8").write("\n// touched2\n")
+        if os.path.isfile(player):
+            open(player, "a", encoding="utf-8").write("\n// touched\n")
+        drifted = graph.collect_stale(dst)
+        check("collect_stale 列出漂移文件",
+              any(p.endswith("Enemy.cs") for p in drifted), str(drifted))
+        h = graph.heal_stale(dst)
+        check("heal_stale 补上漂移文件",
+              "Enemy.cs" in " ".join(h.get("updated") or [])
+              and not h.get("errors"), str(h))
         r3 = queries.impact(dst, "Enemy")
-        check("update 后告警消失", "graph_stale" not in r3, str(r3.get("graph_stale")))
-        # 老库(没有 file_state 表)必须静默降级,不报错也不误报
+        check("heal 后查询干净",
+              "graph_stale" not in r3 and "graph_healed" not in r3,
+              str({k: r3.get(k) for k in ("graph_stale", "graph_healed")}))
+        # 老库(没有 file_state 表)必须静默降级,不报错也不误报、不乱 heal
         conn = graph.connect(dst)
         conn.execute("DROP TABLE file_state")
         conn.commit()
@@ -962,8 +979,9 @@ def test_stale_detection():
         open(enemy, "a", encoding="utf-8").write("\n// touched again\n")
         r4 = queries.impact(dst, "Enemy")
         check("老库无 file_state -> 不告警也不报错",
-              "graph_stale" not in r4 and "错误" not in str(r4.get("hint", "")),
-              str(r4.get("graph_stale")))
+              "graph_stale" not in r4 and "graph_healed" not in r4
+              and "错误" not in str(r4.get("hint", "")),
+              str({k: r4.get(k) for k in ("graph_stale", "graph_healed")}))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -114,13 +114,14 @@ def build_context(project_root: str, target: str, budget_tokens: int = 2000,
                   include_source: bool = False) -> str:
     """针对一个目标生成 evidence-first 上下文,严格不超过估算 token 预算。"""
     budget_tokens = max(1, int(budget_tokens))
+    query_limit = max(3, min(12, budget_tokens // 120))
+    # impact 会在目标文件 stale 时先增量补图,签名必须读补齐后的库
+    imp = impact(project_root, target, limit=query_limit)
     conn = connect(project_root)
     node = resolve_target(conn, target)
     members = _member_lines(conn, node)
     conn.close()
 
-    query_limit = max(3, min(12, budget_tokens // 120))
-    imp = impact(project_root, target, limit=query_limit)
     critical_count = len(members) if node["kind"] in ("method", "field") else 4
     critical, rest = members[:critical_count], members[critical_count:]
     parts = [
