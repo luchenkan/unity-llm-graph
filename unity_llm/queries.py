@@ -163,10 +163,10 @@ def resolve_target(conn, target: str) -> Dict:
         return {"kind": "ambiguous", "of": "method",
                 "candidates": [f"{r['owner']}.{r['name']}" for r in rows][:40]}
     if owner_filter:
-        # 字段 / 属性:名字重名太常见(`Name` / `Id` / `Count` / `Value`),
+        # 字段 / 属性 / 事件:名字重名太常见(`Name` / `Id` / `Count` / `OnClick`),
         # **必须**带 owner 才解析,不做「全项目唯一就猜」——那是只有方法名
-        # 才相对安全的策略。裸属性名的正确查法是先 `unity_find` 定位 owner。
-        for kind in ("field", "property"):
+        # 才相对安全的策略。裸成员名的正确查法是先 `unity_find` 定位 owner。
+        for kind in ("field", "property", "event"):
             frows = conn.execute(
                 "SELECT * FROM members WHERE name=? AND kind=?",
                 (mname, kind)).fetchall()
@@ -247,7 +247,7 @@ def _type_scope(conn, node: Dict):
                 guids.add(g)
         if not guids:
             guids.update(_guids_of_type(conn, node["full_name"]))
-    elif node["kind"] in ("method", "field", "property"):
+    elif node["kind"] in ("method", "field", "property", "event"):
         owners.add(node["owner"])
         names.add(node["name"])
         short.add(node["owner"].split(".")[-1])
@@ -284,6 +284,8 @@ def _present_node(node: Dict) -> Dict:
                  "partial"),
         "method": ("kind", "owner", "name", "signature", "file"),
         "field": ("kind", "owner", "name", "signature", "file"),
+        "property": ("kind", "owner", "name", "signature", "file"),
+        "event": ("kind", "owner", "name", "signature", "file"),
         "ambiguous": ("kind", "of", "candidates"),
         "unknown": ("kind", "input"),
     }.get(node.get("kind"), tuple(node))
@@ -301,7 +303,7 @@ def _stale_field(conn, project_root: str, node: Dict) -> Optional[Dict]:
         paths = [node["path"]]
     elif node.get("kind") == "type":
         paths = list(node.get("files") or [])[:8]
-    elif node.get("kind") in ("method", "field", "property"):
+    elif node.get("kind") in ("method", "field", "property", "event"):
         paths = [node["file"]] if node.get("file") else []
     paths = [p for p in paths if p]
     if not paths:
@@ -362,14 +364,14 @@ def impact(project_root: str, target: str, depth: int = 3,
                  "code_dependents": [],
                  "asset_dependents": [], "event_bindings": [],
                  "summary": {}}
-    if node["kind"] not in ("asset", "type", "method", "field", "property"):
+    if node["kind"] not in ("asset", "type", "method", "field", "property", "event"):
         conn.close()
         out["hint"] = _unresolved_hint(node)
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
     conn, node = _apply_stale(out, conn, project_root, target, node)
-    if node["kind"] not in ("asset", "type", "method", "field", "property"):
+    if node["kind"] not in ("asset", "type", "method", "field", "property", "event"):
         conn.close()
         out["hint"] = out.get("hint") or _unresolved_hint(node)
         return out
@@ -391,7 +393,7 @@ def impact(project_root: str, target: str, depth: int = 3,
         for c in conn.execute(sql, (o,) + confs):
             if c["external"] and not include_external:
                 continue
-            if node["kind"] in ("method", "field", "property") and c["name"] not in names:
+            if node["kind"] in ("method", "field", "property", "event") and c["name"] not in names:
                 continue
             key = (c["src_owner"], c["src_member"], c["name"], c["kind"])
             if key in seen:
@@ -501,11 +503,12 @@ def impact(project_root: str, target: str, depth: int = 3,
     }
     if dropped_assets:
         out["summary"]["excluded_noise_assets"] = dropped_assets
-    if node["kind"] == "property":
-        out["summary"]["note_property"] = (
-            "目标是一个属性。属性访问(`x.Prop`)在 C# 里不是方法调用、不产生调用边,"
-            "所以「调用方为 0」是语言层面的正常结果,**不代表没人使用** —— "
-            "不要据此判断可以删除。属性入库解决的是 find/context 拿得到名字与签名。")
+    if node["kind"] in ("property", "event"):
+        out["summary"]["note_no_call_edge"] = (
+            "目标是属性或事件。属性访问(`x.Prop`)、事件订阅(`x.Evt += h`)在 C# 里"
+            "都不是方法调用,不产生指向它的调用边,所以「调用方为 0」是语言层面的"
+            "正常结果,**不代表没人使用** —— 不要据此判断可以删除。"
+            "这两类入库解决的是 find/context 拿得到名字与签名。")
     if code and not ext_code:
         out["summary"]["note_scope"] = (
             "代码依赖全部是内部自调用(这个类自己的方法互调),"
@@ -527,14 +530,14 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
     node = resolve_target(conn, target)
     out: Dict = {"target": target, "resolved": _present_node(node),
                  "serialized_refs": [], "code_refs": [], "summary": {}}
-    if node["kind"] not in ("asset", "type", "method", "field", "property"):
+    if node["kind"] not in ("asset", "type", "method", "field", "property", "event"):
         conn.close()
         out["hint"] = _unresolved_hint(node)
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
     conn, node = _apply_stale(out, conn, project_root, target, node)
-    if node["kind"] not in ("asset", "type", "method", "field", "property"):
+    if node["kind"] not in ("asset", "type", "method", "field", "property", "event"):
         conn.close()
         out["hint"] = out.get("hint") or _unresolved_hint(node)
         return out
@@ -554,10 +557,10 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
                           "context": r["context"]})
     crefs = []
     # 目标是方法/字段/属性时必须按名字过滤:否则会把整个类型的边都端上来。
-    name_clause = (" AND name=?" if node["kind"] in ("method", "field", "property")
+    name_clause = (" AND name=?" if node["kind"] in ("method", "field", "property", "event")
                    else "")
     name_args = ((node["name"],)
-                 if node["kind"] in ("method", "field", "property") else ())
+                 if node["kind"] in ("method", "field", "property", "event") else ())
     for o in owners:
         for c in conn.execute(
                 "SELECT DISTINCT src_owner, src_member, kind, name, file, line,"
@@ -584,11 +587,12 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
         "external_code_refs": len([c for c in crefs
                                    if c["scope"] == "external"]),
     }
-    if node["kind"] == "property":
-        out["summary"]["note_property"] = (
-            "目标是一个属性。属性访问(`x.Prop`)在 C# 里不是方法调用、不产生调用边,"
-            "所以 code_refs 为空是语言层面的正常结果,**不代表没人使用** —— "
-            "不要据此判断可以删除。要查属性被谁读写,静态调用图给不出答案。")
+    if node["kind"] in ("property", "event"):
+        out["summary"]["note_no_call_edge"] = (
+            "目标是属性或事件。属性访问(`x.Prop`)、事件订阅(`x.Evt += h`)在 C# 里"
+            "都不是方法调用,不产生指向它的调用边,所以 code_refs 为空是语言层面的"
+            "正常结果,**不代表没人使用** —— 不要据此判断可以删除。"
+            "要查谁读写/订阅了它,静态调用图给不出答案。")
     for k, v in (("serialized_refs", sk), ("code_refs", ck)):
         if v["truncated"]:
             out["summary"].setdefault("truncated", {})[k] = v["truncated"]
@@ -684,14 +688,14 @@ def components(project_root: str, target: str,
     conn = connect(project_root)
     node = resolve_target(conn, target)
     out: Dict = {"target": target, "resolved": _present_node(node)}
-    if node["kind"] not in ("asset", "type", "method", "field", "property"):
+    if node["kind"] not in ("asset", "type", "method", "field", "property", "event"):
         conn.close()
         out["hint"] = _unresolved_hint(node)
         return out
     if node.get("hint"):
         out["hint"] = node["hint"]
     conn, node = _apply_stale(out, conn, project_root, target, node)
-    if node["kind"] not in ("asset", "type", "method", "field", "property"):
+    if node["kind"] not in ("asset", "type", "method", "field", "property", "event"):
         conn.close()
         out["hint"] = out.get("hint") or _unresolved_hint(node)
         return out
@@ -1143,6 +1147,8 @@ def stats(project_root: str) -> Dict:
         "assets": one("SELECT count(*) FROM assets"),
         "scripts": one("SELECT count(*) FROM assets WHERE ext='.cs'"),
         "types": one("SELECT count(*) FROM types"),
+        "types_by_kind": {r["kind"]: r["c"] for r in conn.execute(
+            "SELECT kind, count(*) c FROM types GROUP BY kind ORDER BY c DESC")},
         "members": one("SELECT count(*) FROM members"),
         "members_by_kind": {r["kind"]: r["c"] for r in conn.execute(
             "SELECT kind, count(*) c FROM members GROUP BY kind ORDER BY c DESC")},

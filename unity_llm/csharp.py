@@ -1,8 +1,9 @@
 """C# 静态解析器(零依赖,基于正则 + 花括号配对)。
 
 不追求编译器级精度,目标是覆盖 LLM 场景最关键的信息:
-  - 类型声明:class / struct / interface / enum,含命名空间、基类、修饰符
-  - 成员:方法签名、字段,含 [SerializeField] / public 等可见性
+  - 类型声明:class / struct / interface / enum / record / delegate,
+    含命名空间、基类、修饰符
+  - 成员:方法签名、字段、属性、事件,含 [SerializeField] / public 等可见性
   - Unity 语义:生命周期函数(Awake/Start/Update...)、消息方法(OnXxx)、
     SendMessage("...") / GetComponent<T>() / transform.Find("...") 等字符串耦合
   - 调用边:obj.Method() / Method() / new Xxx(),**带接收者表达式、
@@ -81,7 +82,14 @@ CLASS_RE = re.compile(
     r"((?:(?:public|private|protected|internal|static|abstract|sealed|partial|readonly|ref|unsafe|new)[ \t]+)*)"
     r"\b(class|struct|interface|enum|record)[ \t]+(\w+)"
     r"(?:[ \t]*<[^>\n{}]*>)?"
-    r"(?:[ \t]*:[ \t]*([^\{\n]+?))?[ \t]*(?:\r?\n[ \t]*)?\{"
+    # positional record 的参数表:`record Foo(int X, string Y);`。
+    # 旧版不认这种写法,**整条类型都进不了图**(比成员丢失更严重)。
+    # 参数名会另外收成属性(编译器为它们生成 init-only 属性)。
+    # 这一组插在 bases 之前,所以下面 bases 的组号由 5 变成 6 —— 调用处同步改了。
+    r"(?:[ \t]*\(([^)\n]*)\))?"
+    r"(?:[ \t]*:[ \t]*([^\{\n]+?))?"
+    # 结尾可以是 `{`(有体)或 `;`(positional record 没有体)
+    r"[ \t]*(?:\r?\n[ \t]*)?(?:\{|;)"
 )
 METHOD_RE = re.compile(
     _ATTR +
@@ -97,7 +105,11 @@ METHOD_RE2 = re.compile(
 )
 FIELD_RE = re.compile(
     _ATTR +
-    r"((?:(?:public|private|protected|internal|static|readonly|const|volatile|new)[ \t]+)+)"
+    # required 是 C# 11 的修饰符:Unity 2022(含团结引擎 2022.3)只到 C# 9,
+    # 业务代码里不会出现,但框架会跑在更新引擎的项目上 —— 漏掉它该字段会整个丢失,
+    # 收着不吃亏。
+    r"((?:(?:public|private|protected|internal|static|readonly|const|volatile|new|"
+    r"required)[ \t]+)+)"
     # `=(?!>)`:表达式体属性 `public float X => _x;` 不是字段,不能当序列化字段
     r"([\w<>\[\],.\?]+)[ \t]+(\w+)[ \t]*(?:=(?!>)[^;\n]*)?;"
 )
@@ -130,13 +142,47 @@ PROPERTY_RE = re.compile(
     r"[ \t\r\n]*(?:\{[ \t\r\n]*(?:get|set|init)\b|=>)",
     re.MULTILINE,
 )
+# 事件(event)。C# 里 event 是**独立的成员类别**,既不是字段也不是属性:
+# `public event Action OnDead;` 尾部虽是 `;`,但 `event` 不在 FIELD_RE 的修饰符表里,
+# 所以旧版完全收不到 —— 实测某 4.4 万资产项目 245 条(223 字段式 + 22 自定义访问器),
+# 图谱里 0 条。表现和属性盲点同型:find 搜不到事件名、refs Owner.Event 解析成 unknown、
+# context 列不出「这个类会通知谁」。
+# 注意 deadcode 不受影响:订阅点 `Foo.OnDead += Handler` 早就被 method_ref 记成
+# Handler 被引用;这里补的是**事件本身**的可发现性。
+# 两种写法都收:字段式 `event Action X;` 与自定义访问器式 `event Action X { add; remove }`。
+EVENT_RE = re.compile(
+    r"^[ \t]*" + _ATTR +
+    r"((?:(?:public|private|protected|internal|static|virtual|override|abstract|"
+    r"sealed|new|unsafe|extern)[ \t]+)*)"
+    r"event[ \t]+"
+    r"([\w<][\w<>\[\],.\?]*(?:[ \t]+[\w<][\w<>\[\],.\?]*)?)[ \t]+(\w+)"
+    r"[ \t\r\n]*(?:;|\{[ \t\r\n]*(?:add|remove)\b|=>)",
+    re.MULTILINE,
+)
+# delegate 是**类型声明**(编译器生成的委托类),不是成员。
+# CLASS_RE 只认 class/struct/interface/enum/record,所以旧版整个委托类型都不在图里 ——
+# 实测该项目 58 条。与 record 的 positional 形式同属「类型级丢失」,比成员丢失更严重。
+DELEGATE_RE = re.compile(
+    r"^[ \t]*" + _ATTR +
+    r"((?:(?:public|private|protected|internal|unsafe|new)[ \t]+)*)"
+    r"delegate[ \t]+"
+    r"([\w<][\w<>\[\],.\?]*(?:[ \t]+[\w<][\w<>\[\],.\?]*)?)[ \t]+(\w+)"
+    r"[ \t]*(?:<[^>\n]*>)?[ \t]*\(([^)]*)\)[ \t]*;",
+    re.MULTILINE,
+)
 CALL_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
-DOTCALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
+# `\??`:空条件调用 `cache?.Release()`。C# 里事件、可选依赖、缓存命中的惯用写法,
+# 实测某项目 1772 条 / 涉及 555 个文件,其中 53% 指向非 Invoke 的业务方法
+# (`Release` / `ResolveRef` / `Refresh` / `Cancel`)。旧正则因为 `.` 前多了个 `?`
+# 全部漏掉 —— 不只是少一条边,还会让只被 `x?.Foo()` 调用的方法被误报成死代码。
+DOTCALL_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*\??\s*\.\s*([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
 # Type.Field.Method() —— 静态字段/单例上的链式调用。
 # 两段 DOTCALL 只会看成 Field.Method,recv_type 被大写启发式误判成字段名,
 # 事件总线、Xxx.Instance.Foo() 都会因此掉进 low。
 CHAIN_CALL_RE = re.compile(
-    r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
+    r"\b([A-Za-z_]\w*)\s*\??\s*\.\s*([A-Za-z_]\w*)\s*\??\s*\.\s*([A-Za-z_]\w*)"
+    r"\s*(?:<[^>]*>)?\s*\(")
 GENERIC_APIS = (
     "GetComponent", "GetComponentInChildren", "GetComponentInParent",
     "GetComponents", "GetComponentsInChildren", "GetComponentsInParent",
@@ -335,6 +381,23 @@ class CsProperty:
 
 
 @dataclass
+class CsEvent:
+    """C# 事件。与属性一样,只服务于「这个类型对外有哪些 API」。
+
+    订阅点(`X += Handler`)是一条 method_ref 边,记录的是 **Handler**;
+    事件名本身永不出现在 calls 里 —— 所以 event 同样"没有调用方",
+    这是语言事实,不是图谱漏了。
+    is_custom 标记自定义 add/remove 访问器(非编译器生成的字段式事件)。
+    """
+    name: str
+    type: str
+    modifiers: str
+    attributes: str
+    line: int
+    is_custom: bool = False
+
+
+@dataclass
 class CsType:
     name: str
     kind: str            # class / struct / interface / enum / record
@@ -348,6 +411,7 @@ class CsType:
     methods: List[CsMethod] = field(default_factory=list)
     fields: List[CsField] = field(default_factory=list)
     properties: List[CsProperty] = field(default_factory=list)
+    events: List[CsEvent] = field(default_factory=list)
 
     @property
     def full_name(self) -> str:
@@ -486,17 +550,53 @@ def parse_csharp(text: str, path: str = "") -> CsFile:
                 ns = n.group(1)
             else:
                 break
-        body_start = m.end() - 1  # '{' 的位置
+        # 结尾可能是 `{`(有体)或 `;`(positional record,没有体)。
+        # 绝不能把 `;` 的位置当成 body_start —— 那样 _enclosing_class 的区间判断
+        # 会把它后面的所有成员都算到这个类型名下。
+        if m.group(0).endswith("{"):
+            body_start = m.end() - 1  # '{' 的位置
+            body_end = braces.get(body_start, len(clean))
+        else:
+            body_start = body_end = None
         t = CsType(
             name=m.group(4), kind=m.group(3), namespace=ns,
             modifiers=" ".join(m.group(2).split()),
             attributes=" ".join(m.group(1).split()),
-            bases=_parse_bases(m.group(5)),
+            bases=_parse_bases(m.group(6)),   # 组 6:组 5 让给了 positional 参数表
             line=line_of(m.start()),
             body_start=body_start,
-            body_end=braces.get(body_start, len(clean)),
+            body_end=body_end,
         )
+        # positional record 的参数就是编译期生成的 init-only 属性,收成属性。
+        # 类型经 _parse_params 归一为短名(会丢泛型实参),与接收者推断共用同一口径。
+        if m.group(3) == "record" and m.group(5):
+            for pname, ptype in _parse_params(m.group(5)).items():
+                t.properties.append(CsProperty(
+                    name=pname, type=ptype, modifiers="public",
+                    attributes="", line=line_of(m.start()),
+                ))
         result.types.append(t)
+
+    # 委托类型。CLASS_RE 认不出 `delegate`,所以旧版整个委托类型都不在图里 ——
+    # 放在这里(类型区)而不是成员区,是为了让后面的 field_scopes 覆盖到它,
+    # 避免方法解析时 field_scopes[id(owner)] 取空。delegate 没有体,body 留空。
+    for m in DELEGATE_RE.finditer(clean):
+        dname = m.group(4)
+        if dname in CS_KEYWORDS:
+            continue
+        ns = ""
+        for n in ns_matches:
+            if n.start() < m.start():
+                ns = n.group(1)
+            else:
+                break
+        result.types.append(CsType(
+            name=dname, kind="delegate", namespace=ns,
+            modifiers=" ".join(m.group(2).split()),
+            attributes=" ".join(m.group(1).split()),
+            bases=[], line=line_of(m.start()),
+            body_start=None, body_end=None,
+        ))
 
     # 字段先行:方法体里的 `field.Method()` 需要字段声明类型才能定向
     for m in FIELD_RE.finditer(clean):
@@ -532,6 +632,24 @@ def parse_csharp(text: str, path: str = "") -> CsFile:
             attributes=" ".join(m.group(1).split()),
             line=line_of(m.start()),
             is_expression=m.group(0).rstrip().endswith("=>"),
+        ))
+
+    # 事件。同样只登记可发现性,不抽 add/remove 访问器里的调用。
+    for m in EVENT_RE.finditer(clean):
+        owner = _enclosing_class(m.start(), result.types)
+        if owner is None:
+            continue
+        ename = m.group(4)
+        if ename in CS_KEYWORDS:
+            continue
+        owner.events.append(CsEvent(
+            name=ename, type=m.group(3),
+            modifiers=" ".join(m.group(2).split()),
+            attributes=" ".join(m.group(1).split()),
+            line=line_of(m.start()),
+            # 字段式事件以 `;` 收尾;自定义访问器式只匹配到 `{ add/remove` 就结束了
+            # (group(0) 不含收尾的 `}`),所以判据是「不是分号结尾」。
+            is_custom=not m.group(0).rstrip().endswith(";"),
         ))
 
     field_scopes = {id(t): {f.name: short_type(f.type) for f in t.fields}

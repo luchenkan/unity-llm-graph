@@ -1,0 +1,49 @@
+#!/bin/sh
+# unity-llm-graph: git post-checkout hook —— 切分支后增量刷新依赖图谱。
+#
+# 为什么需要它:post-commit / post-merge / post-rewrite 都不覆盖 `git checkout`。
+# 在同一个 worktree 里来回切分支(比如 release 改 bug ↔ dev 继续开发)时,
+# 图谱还是上一个分支的,查询会基于**错误的结构**作答 —— 这比"图旧了"更危险,
+# 因为结果看起来依然合理。
+#
+# 参数:$1=旧 HEAD, $2=新 HEAD, $3=1 表示分支切换 / 0 表示单文件检出。
+# 只在分支切换($3=1)时跑;单文件检出动一两个文件,交给查询期自愈就够了。
+#
+# 代价:分支间差异可能有几百到几千个文件,而且 update 会顺带全局重跑一次调用边
+# 解析,所以后台可能跑几十秒到几分钟。它在后台执行,不阻塞 checkout。
+#
+# 如果你本来就为每个分支开了独立 worktree(推荐),这个 hook 是多余的 ——
+# 每个 worktree 有自己的 .unity-llm/graph.db,天然隔离。
+#
+# 装法:
+#   cp tools/post-checkout.sample <repo>/.git/hooks/post-checkout
+#   chmod +x <repo>/.git/hooks/post-checkout
+#   然后把下面 UNITY_LLM_DIR 改成本框架仓库路径
+
+UNITY_LLM_DIR="/c/Users/you/unity-llm-graph"
+
+[ "$3" = "1" ] || exit 0
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$ROOT/.unity-llm/graph.db" ] || exit 0   # 没建过图就不管
+
+PREV="$1"
+[ -n "$PREV" ] || exit 0
+# 首次 checkout 时 $1 可能是全 0 的空对象,cat-file 会失败,直接放行
+git cat-file -e "$PREV^{commit}" 2>/dev/null || exit 0
+
+# 切分支会重写所有差异文件的 mtime,所以 --stale 能覆盖绝大部分;
+# --files 额外收那些**从未进过 file_state** 的新资产(新文件不在表里,--stale 看不见)。
+FILES=$(git diff --name-only "$PREV" HEAD 2>/dev/null \
+        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$' || true)
+
+cd "$UNITY_LLM_DIR" 2>/dev/null || exit 0
+if [ -n "$FILES" ]; then
+    python -m unity_llm update --project "$ROOT" --stale --files $FILES \
+        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+else
+    python -m unity_llm update --project "$ROOT" --stale \
+        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
+fi
+
+exit 0

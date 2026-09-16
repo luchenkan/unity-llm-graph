@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS types (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     full_name TEXT NOT NULL,
-    kind TEXT NOT NULL,
+    kind TEXT NOT NULL,         -- class / struct / interface / enum / record / delegate
     namespace TEXT NOT NULL,
     bases TEXT NOT NULL,
     modifiers TEXT NOT NULL,
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS types (
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner TEXT NOT NULL,        -- 所属类型 full_name
-    kind TEXT NOT NULL,         -- method / field
+    kind TEXT NOT NULL,         -- method / field / property / event
     name TEXT NOT NULL,
     signature TEXT NOT NULL,
     modifiers TEXT NOT NULL,
@@ -503,6 +503,18 @@ def _insert_csharp(cur, text: str, rel: str, guid: str, ext_flag: int) -> dict:
                 " serialized, code_used, external) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (t.full_name, "property", pr.name, f"{pr.type} {pr.name}",
                  pr.modifiers, pr.attributes, pr.type, pr.line, rel, guid,
+                 0, 0, 0, 0, ext_flag))
+            n["members"] += 1
+        # 事件。同属性:入 members 只为可发现性。订阅点 `X += Handler` 是一条
+        # method_ref 边,记的是 **Handler**,事件名不进 calls —— 所以事件也
+        # "没有调用方",且因为 dead-code 只扫 kind='method'/'field',它不进任何榜。
+        for ev in t.events:
+            cur.execute(
+                "INSERT INTO members(owner, kind, name, signature, modifiers,"
+                " attributes, extra, line, file, guid, is_lifecycle, is_message,"
+                " serialized, code_used, external) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (t.full_name, "event", ev.name, f"{ev.type} {ev.name}",
+                 ev.modifiers, ev.attributes, ev.type, ev.line, rel, guid,
                  0, 0, 0, 0, ext_flag))
             n["members"] += 1
     return n

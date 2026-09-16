@@ -2,7 +2,7 @@
 
 Brief for later reviewers. Do not treat README or the 5-script fixture as the product.
 
-Framework: **unity-llm-graph** `0.10.0`  
+Framework: **unity-llm-graph** `0.11.0`  
 Repo: https://github.com/luchenkan/unity-llm-graph
 Constraint: zero runtime deps, Python ≥ 3.9, stdlib only.
 
@@ -31,6 +31,7 @@ Two MCP servers can and should run together: this one answers “what is coupled
 | 7 | DeepSeek-V4-Pro | Reviewed **adoption**, not the fixture: read a production project's `calls.log`, token ledger, hook config, and a competing Editor MCP. Found Grok 4.6's diagnosis was still unfixed, then patched 0.7.0 to take the Editor MCP's "list hierarchy / components" query off the table. |
 | 9 | GLM-5.3 | Author of 0.7.3 (pull/merge/rebase auto-refresh hooks) and 0.8.0 (stale detection, `digest`, `usage`, error self-correction). Works daily on the same production project. |
 | 10 | DeepSeek-V4.1-Flash | Reviewed the production project's `calls.log` (again, not the fixture) and found the **property blind spot**: `members.kind` had no `property` at all. Shipped 0.10.0. |
+| 11 | DeepSeek-V4.1-Flash | Ran a **declaration-coverage census** on the production project instead of reading the README's TODOs: found `event` / `delegate` / positional `record` missing, and — more valuable — that `x?.Foo()` (1772 call sites) was never a call edge. Shipped 0.11.0. |
 
 Round 5 is the first pass that measured **which tools models actually invoked**, and that rejected encoding one game’s bus type into the engine.
 
@@ -51,14 +52,14 @@ Round 5 is the first pass that measured **which tools models actually invoked**,
 - **Cursor ≠ Claude Code MCP paths.** Project-root `.mcp.json` does not mean Cursor loaded the server.
 - Round 5 first pass over-fit a project event bus name into MCP copy. That was reverted: the engine now matches **`Type.Field.Method()`** (PascalCase type, any method), kind `field_call`. Old kind `relay` is still read for stale DBs.
 
-## Current shape (`0.10.0`)
+## Current shape (`0.11.0`)
 
 ```
 meta.py          guid ← .meta and/or guidmap.tsv
 unity_yaml.py    guid refs + UnityEvent + GameObject name via m_GameObject
                  + fileID object graph (Transform m_Father, component m_GameObject)
-csharp.py        types / methods / fields / properties, lifecycle, string APIs,
-                 method_ref, field_call
+csharp.py        types / methods / fields / properties / events / delegates,
+                 lifecycle, string APIs, method_ref, field_call, `x?.Foo()`
 visual_assets.py Animator state machines + Timeline tracks/clips
 graph.py         SQLite union + call resolution + is_mono inheritance walk
                  + objects table + file_state (staleness) + atomic build
@@ -68,7 +69,7 @@ queries.py       impact / refs / components (with hierarchy tree) / deadcode /
 mcp_server.py    tools split into core/full/admin profiles
 ```
 
-Tests: 213 assertions / 33 groups on `tests/fixtures/SampleProject`.
+Tests: 227 assertions / 34 groups on `tests/fixtures/SampleProject`.
 
 ## Open questions for the next model
 
@@ -362,3 +363,74 @@ a language fact, not evidence.
 5. Syntax forms still not covered: **indexers** (`this[int]`, deliberately out) and
    **explicit interface implementations** (`int IFoo.Hp => …`, currently collected
    as an ordinary property).
+
+## Round 11 — declaration-coverage audit (0.11.0)
+
+Reviewed by **DeepSeek-V4.1-Flash** (WorkBuddy). Round 10 fixed one blind spot;
+this round asks the general question: **what other C# declaration forms never make
+it into the graph?** The method is the point — enumerate the forms that actually
+exist in the project with independent regexes, count them, then check the graph
+for each.
+
+### The audit (source count → graph rows, before this round)
+
+| form | source | graph | verdict |
+| --- | --- | --- | --- |
+| `event` | 245 in `Assets/`, **353** project-wide | 0 | fix |
+| `delegate` | 58 / **141** | 0 (no such `kind` in `types`) | fix |
+| positional `record` | 0 | 0 | fix (type-level loss) |
+| `required` field | 0 | 0 | collect defensively (C# 11) |
+| indexer `this[]` | 244 | 0 | leave out (not a named member) |
+| `operator` overload | 24 | 0 | leave out (no cross-type dependency) |
+
+**The audit also surfaced something worth more than `event` itself: `x?.Foo()`.**
+It is not a *declaration* form, so it never appeared in the table above — I found
+it while picking examples for `event`: `OnDead?.Invoke()` has a `?` before the dot,
+which makes `DOTCALL_RE` miss the whole thing. Measured: **1772 call sites across
+555 files, 53% of them pointing at non-`Invoke` business methods**
+(`Release` / `ResolveRef` / `Refresh` / `Cancel`). Worse, it *cascades into
+dead-code false positives*, because a method only ever called via `?.` has no
+caller on the graph. After the fix, dead-code candidates went **326 → 309** and
+call edges **255095 → 257860**.
+
+**Lesson worth carrying forward:** a coverage audit must cover **call syntax**,
+not just member/type declarations. One piece of language sugar outranked every
+new member kind in this round.
+
+### Three implementation traps (for the next reviewer)
+
+1. **`delegate` must be parsed in the type region.** It has no `{}` body, so
+   `body_start` stays `None`; parsing it there also lets the immediately following
+   `field_scopes` cover it — otherwise member parsing hits
+   `field_scopes[id(owner)]` and raises `KeyError`.
+2. **Positional `record` has a hidden trap.** `CLASS_RE` previously required a
+   trailing `{`; I added a `;` branch. But `body_start = m.end() - 1` then points
+   at the semicolon, and `_enclosing_class`'s interval test would assign **every
+   following member** to that type. It must be explicitly left empty. That change
+   also pushed the `bases` capture group from 5 to 6.
+3. **Both `event` forms matter.** For the accessor form the regex stops at
+   `{ add`, so `group(0)` does *not* contain the closing `}` — "is this a custom
+   accessor" must be decided by "does not end with `;`", not "ends with `}`".
+   (The first implementation got this wrong; the fixture caught it.)
+
+### Deliberately not done
+
+- **Indexers** (`this[int]`): 244 occurrences, but they have no named-member
+  identity — collecting them would only blur the property bucket.
+- **Operator overloads**: 24, no cross-type dependency.
+- **Other modern C# features**: first established the ceiling — **Unity 2022.3 and
+  Tuanjie 2022.3.62t4 both stop at C# 9**, so C# 10 file-scoped namespaces,
+  C# 11 `required` and C# 12 primary constructors *cannot occur* in this project.
+  I only added `required` (one word, leaves the door open for newer engines).
+  The rule used here, worth reusing: **add a feature when it affects dependency-graph
+  correctness, not when it merely looks modern.**
+
+### Checklist for the next reviewer
+
+1. Re-run the declaration census above; event/delegate counts should track source.
+2. Spot-check a `?.` edge: find a method called *only* via `?.` and confirm it is
+   no longer in the dead-code list.
+3. Verify positional-record attribution: members declared *after* `record Foo(int A);`
+   must not end up owned by `Foo`.
+4. Confirm the "collect but ignore" boundaries (`required`, indexers) stay quiet —
+   no new false positives.

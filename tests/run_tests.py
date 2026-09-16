@@ -71,7 +71,7 @@ def test_build():
     print("[1] build")
     stats = graph.build(FIXTURE)
     check("脚本数", stats["scripts"] == 10, str(stats))
-    check("类型数", stats["types"] == 13, str(stats))
+    check("类型数", stats["types"] == 15, str(stats))
     check("YAML 资产数", stats["yaml_assets"] == 6, str(stats))
     check("序列化引用数>=5", stats["refs"] >= 5, str(stats))
     check("资产数>=9", stats["assets"] >= 9, str(stats))
@@ -1131,12 +1131,12 @@ def test_properties():
     check("refs 对属性不报 unknown",
           rr["resolved"].get("kind") == "property", str(rr["resolved"]))
     check("refs 对属性给出「0 引用正常」的提示",
-          "note_property" in rr["summary"], str(rr["summary"]))
+          "note_no_call_edge" in rr["summary"], str(rr["summary"]))
     imp = queries.impact(FIXTURE, "Player.Hp")
     check("impact 对属性不报 unknown",
           imp["resolved"].get("kind") == "property", str(imp["resolved"]))
     check("impact 对属性给出「0 引用正常」的提示",
-          "note_property" in imp["summary"], str(imp["summary"]))
+          "note_no_call_edge" in imp["summary"], str(imp["summary"]))
     # context 列出属性(数据模型类的 API 面几乎全是属性)
     text = context_mod.build_context(FIXTURE, "Player", budget_tokens=3000)
     check("context 列出属性", "property" in text, text[:300])
@@ -1150,6 +1150,55 @@ def test_properties():
     # 新库不该误报「老库缺属性」
     upd = graph.update_files(FIXTURE, ["Assets/Scripts/Player.cs"])
     check("新库 update 不误报老库提示", "hint" not in upd, str(upd.get("hint")))
+
+
+def test_events_and_types():
+    print("[34] 事件 / 委托 / positional record / 空条件调用")
+    s = queries.stats(FIXTURE)
+    check("事件进入 members", s["members_by_kind"].get("event", 0) >= 3,
+          str(s["members_by_kind"]))
+    tkind = s["types_by_kind"]
+    check("delegate 进入 types", tkind.get("delegate", 0) >= 1, str(tkind))
+    check("record 进入 types", tkind.get("record", 0) >= 1, str(tkind))
+    conn = graph.connect(FIXTURE)
+    evs = {r["name"]: r["signature"] for r in conn.execute(
+        "SELECT name,signature FROM members WHERE kind='event'"
+        " AND owner='Game.Combat.Player'")}
+    check("三种事件写法全入库(字段式/静态/自定义访问器)",
+          {"OnDied", "OnLevelUp", "OnDamaged"} <= set(evs), str(list(evs)))
+    check("事件签名带类型", evs.get("OnDied", "").endswith("OnDied"),
+          str(evs.get("OnDied")))
+    res = queries.resolve_target(conn, "Player.OnDied")
+    check("Player.OnDied 解析为 event", res.get("kind") == "event", str(res))
+    bare = queries.resolve_target(conn, "OnDied")
+    check("裸事件名不做全局猜测(要求 Owner.Event)",
+          bare.get("kind") != "event", str(bare))
+    props = {r["name"] for r in conn.execute(
+        "SELECT name FROM members WHERE kind='property'"
+        " AND owner='Game.Combat.DamageInfo'")}
+    check("positional record 的参数收成属性",
+          {"Amount", "Source"} <= props, str(props))
+    dres = queries.resolve_target(conn, "PlayerEventHandler")
+    check("delegate 类型可解析", dres.get("kind") == "type", str(dres))
+    conn.close()
+    # 空条件调用:x?.Foo() 过去整条边都漏,会让只被这样调用的方法误报死代码
+    imp = queries.impact(FIXTURE, "Enemy.TakeDamage")
+    callers = {c["caller"] for c in imp["code_dependents"]}
+    check("空条件调用 target?.TakeDamage() 算作调用方",
+          any("Player.Notify" in c for c in callers), str(callers))
+    rr = queries.find_refs(FIXTURE, "Player.OnDied")
+    check("refs 对事件不报 unknown",
+          rr["resolved"].get("kind") == "event", str(rr["resolved"]))
+    check("refs 对事件给出「0 引用正常」的提示",
+          "note_no_call_edge" in rr["summary"], str(rr["summary"]))
+    imp2 = queries.impact(FIXTURE, "Player.OnDied")
+    check("impact 对事件给出「0 引用正常」的提示",
+          "note_no_call_edge" in imp2["summary"], str(imp2["summary"]))
+    dc = queries.dead_code(FIXTURE)
+    fields = {f["field"] for f in dc["maybe_unused_fields"]}
+    check("事件不进「未使用字段」榜",
+          not any("OnDied" in f or "OnDamaged" in f or "OnLevelUp" in f
+                  for f in fields), str(fields))
 
 
 def main():
@@ -1169,7 +1218,7 @@ def main():
              test_build_progress, test_visual_assets,
              test_visual_query_end_to_end,
              test_stale_detection, test_digest, test_usage, test_error_report,
-             test_properties]
+             test_properties, test_events_and_types]
     failed = 0
     for t in tests:
         try:
