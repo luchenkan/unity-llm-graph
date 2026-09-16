@@ -3,6 +3,45 @@
 > 每版的主题与实测数据。行为约定变更见 [REVIEWS.md](REVIEWS.md)，
 > 能力边界见 [README 的能力与局限](README.md#能力与局限诚实声明)。
 
+### 0.11.1
+
+主题:**声明解析的正确性回归** —— 0.10/0.11 引进的属性与事件正则有两类系统性错误:
+该收的收不到(类型名片段太窄),不该收的收进来(幻影属性)。都在 4576 个脚本的真实项目上
+跑了新旧解析器 A/B 对比,以「丢 0 条真声明」为验收线。
+
+| 问题 | 规模(4576 脚本商业项目) | 症状 |
+| --- | --- | --- |
+| 幻影属性 | **7 条** | `switch` 表达式的类型模式臂、多参 lambda 续行被当成属性;其中 3 条把内部类名注册成了公开属性 |
+| 三参泛型声明 | event **11 条** / property 若干 | `Action<int, string, bool> X` 整条声明丢失 |
+| `ref` 返回属性 | **29 条** | `ref T NextNode { get; }` 的 `ref` 不在修饰符表里,整条丢失 |
+| `Generic<K,V>.Member` 类型 | **2 条** | `Dictionary<K,V>.ValueCollection Foo => …` 整条丢失 |
+| 嵌套类型 `full_name` | **+32 个** distinct | `Player.Phase` 与 `Sidekick.Phase` 塌成同一个 `full_name`,成员互相混进对方名下 |
+
+- **花括号深度守卫**(`_brace_depths` / `_is_member_level`):属性与事件的声明必须直接位于
+  类型体第一层。`switch` 表达式的类型模式臂 `CardMainConfig config => config,` 行首、
+  缩进、「类型 + 名字 + `=>`」全都合法,**正则挡不住,只有深度能**。不能改用「落在方法体
+  跨度内就丢弃」—— 幻影也出现在**属性自己的表达式体**里。
+- **共用类型片段 `_TYPE`**:给 `PROPERTY_RE` / `EVENT_RE` / `DELEGATE_RE` 统一收
+  两层嵌套泛型、数组、可空、以及泛型闭合后的 `.Member`。旧写法是「标识符最多一次空格分隔」
+  且**允许裸逗号**,既漏三参泛型、又把 `Foo(a, builder =>` 这种续行认成属性。
+- **`PROPERTY_RE` 修饰符表补 `ref`**(`ref readonly` 由两个修饰符各匹配一次覆盖)。
+- **事件多声明符**:`event Action OnOpen, OnClose;` 逐个入库(旧版只收第一个,且名字带逗号)。
+- **`record struct` / `record class`**:旧 `CLASS_RE` 里裸 `record` 分支先命中,
+  名字被解析成关键字 `struct`,整条类型丢失。
+- **嵌套类型 `full_name` 带外层类名**(`namespace.Outer.Inner`)。`_resolve_calls` 按
+  **短名**分桶、`resolve_target` 用 `endswith("." + filter)`,两处都不受影响。
+  **注意:已有 `graph.db` 需要全量 `build` 才能生效。**
+- **`field_scopes` 纳入属性**:`Rival.TakeDamage()` 里 `Rival` 是属性时,旧版查不到类型,
+  只能靠「大写开头 = 静态调用」兜底,推成不存在的类型。
+- **旧库提示不再误报**:`update` 的「这是旧版本建的库」判断原先在写入**之后**读计数,
+  本次更新的文件一旦带属性/事件就永远不提示。改为在写入前快照。
+- **`post-checkout.sample` 走 stdin**:未加引号的 `$FILES` 会被 shell 按空格再切一刀
+  (路径带空格就散架),分支间几千个文件还容易撞 argv 上限、hook 静默失败。
+- A/B 实测(4576 脚本,同进程新旧对比):类型行数 8050 = 8050 **一条不丢**,
+  kinds 分布完全一致,property 真丢失 **0** / 新增 10,event 真丢失 **0** / 新增 11,
+  distinct 类型 7744 → 7776,耗时 +0.9%(无灾难性回溯)。
+- 测试 227 → **240 项断言 / 35 组**。
+
 ### 0.11.0
 
 主题:**补两类「结构性看不见」** —— 事件/委托这一类成员与类型,以及空条件调用这一种最基本的调用形式。

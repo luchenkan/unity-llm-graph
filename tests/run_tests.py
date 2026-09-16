@@ -71,7 +71,7 @@ def test_build():
     print("[1] build")
     stats = graph.build(FIXTURE)
     check("脚本数", stats["scripts"] == 10, str(stats))
-    check("类型数", stats["types"] == 15, str(stats))
+    check("类型数", stats["types"] == 21, str(stats))
     check("YAML 资产数", stats["yaml_assets"] == 6, str(stats))
     check("序列化引用数>=5", stats["refs"] >= 5, str(stats))
     check("资产数>=9", stats["assets"] >= 9, str(stats))
@@ -1201,6 +1201,61 @@ def test_events_and_types():
                   for f in fields), str(fields))
 
 
+def test_declaration_edge_cases():
+    print("[35] 声明解析边界(switch 表达式 / 嵌套类型 / 多声明符 / 显式接口实现)")
+    conn = graph.connect(FIXTURE)
+    props = {r["name"] for r in conn.execute(
+        "SELECT name FROM members WHERE kind='property'"
+        " AND owner LIKE 'Game.Combat.Player%'")}
+    # switch 表达式的类型模式臂 `Enemy phantomEnemy => "enemy",` 在行首、
+    # 长得就是「类型 名字 =>」。两处夹具:一处在方法体里,一处在属性的表达式体里
+    # (所以不能用「方法体跨度」过滤)。实测某商业项目 5 条幻影属性由此而来。
+    phantom = {p for p in props if p.startswith("phantom")}
+    check("switch 表达式的类型模式臂没被误当属性", not phantom, str(props))
+    check("同一批里真属性仍在",
+          {"Hp", "IsAlive", "DisplayName", "PhaseName"} <= props, str(props))
+    check("显式接口实现只留最后一段名字", "Count" in props, str(props))
+    check("三参泛型属性没丢", "OnBigAction" in props, str(props))
+    # 类型片段的两个真实回归(A/B 实测:这两类合计丢了 37 条真属性)
+    check("泛型闭合后带 `.成员` 的类型没丢", "Slots" in props, str(props))
+
+    tnode = {r["name"] for r in conn.execute(
+        "SELECT name FROM members WHERE kind='property'"
+        " AND owner='Game.Combat.ITaskNode'")}
+    check("`ref` 返回属性没丢", "NextNode" in tnode, str(tnode))
+
+    evs = {r["name"] for r in conn.execute(
+        "SELECT name FROM members WHERE kind='event'"
+        " AND owner='Game.Combat.Player'")}
+    check("三参泛型事件没丢", "OnTriple" in evs, str(evs))
+    check("带初始化器的事件没丢", "OnReady" in evs, str(evs))
+    check("多声明符事件逐个入库", {"OnOpen", "OnClose"} <= evs, str(evs))
+
+    tkind = queries.stats(FIXTURE)["types_by_kind"]
+    check("record struct 进入 types", tkind.get("record struct", 0) >= 1, str(tkind))
+    hit = {r["name"] for r in conn.execute(
+        "SELECT name FROM members WHERE kind='property'"
+        " AND owner='Game.Combat.HitResult'")}
+    check("record struct 的 positional 参数收成属性",
+          {"Damage", "Critical"} <= hit, str(hit))
+
+    # 嵌套类型的 full_name 必须带外层类名,否则 Player.Phase 和 Sidekick.Phase
+    # 塌成同一个 full_name,成员互相混进对方名下。
+    nested = {r["full_name"] for r in conn.execute(
+        "SELECT full_name FROM types WHERE name='Phase'")}
+    check("嵌套类型 full_name 带外层类名",
+          {"Game.Combat.Player.Phase", "Game.Combat.Sidekick.Phase"} <= nested,
+          str(nested))
+    conn.close()
+
+    # 属性参与接收者推断:`Rival.TakeDamage()` 里 Rival 是属性,旧版 scope 查不到,
+    # 只能靠「大写开头 = 静态调用」兜底,推成不存在的 Rival 类型。
+    imp = queries.impact(FIXTURE, "Enemy.TakeDamage")
+    callers = {c["caller"] for c in imp["code_dependents"]}
+    check("属性接收者能定向到属性类型",
+          any("Player.Strike" in c for c in callers), str(callers))
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1218,7 +1273,8 @@ def main():
              test_build_progress, test_visual_assets,
              test_visual_query_end_to_end,
              test_stale_detection, test_digest, test_usage, test_error_report,
-             test_properties, test_events_and_types]
+             test_properties, test_events_and_types,
+             test_declaration_edge_cases]
     failed = 0
     for t in tests:
         try:

@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-227%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-240%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / delegates / methods / fields / properties / events /
@@ -336,8 +336,10 @@ python tests/run_tests.py
 并覆盖 partial、namespace 重名、原子 build、tombstone、MCP profile 和严格
 token 预算,以及 **stale 检测(磁盘变更自愈/老库降级)、digest 聚合、usage
 采用率报告**、**C# 属性入库(四种写法 / `Owner.Prop` 解析 / LINQ lambda 不误报)**、
-**事件与委托入库、positional record、空条件调用 `x?.Foo()`**。
-共 **227 项断言 / 34 个测试组**。
+**事件与委托入库、positional record、空条件调用 `x?.Foo()`**、
+**声明解析边界(switch 表达式类型模式臂不误当属性、`ref` 返回属性、
+`Generic<K,V>.Member` 类型、多声明符事件、嵌套类型 `full_name`)**。
+共 **240 项断言 / 35 个测试组**。
 
 ## 能力与局限(诚实声明)
 
@@ -352,10 +354,18 @@ UnityEvent 绑定溯源、新人上手项目地图、**类型的完整 API 面(�
   推不出来 —— 这些边会落到 `low` 并被默认过滤,**宁可漏报不误报**;
 - 反射、热更框架(HybridCLR / xLua / ILRuntime)、Timeline / Animation Event 入口
   **静态分析天然不可见**,dead-code 结果永远需要人工复核(工具自带免责声明);
-- **属性不产生调用边**:`x.Prop` 在 C# 里不是方法调用,所以 `impact` / `refs`
-  对属性只给类型层面的资产依赖,不会有「谁读写了它」。属性入库是为了让
-  `find` 搜得到名字、`context` 列得出签名 —— 而且属性恒不计入 dead-code
-  (Unity 不序列化属性,属性是公开 API 面);getter/setter 体里的调用也暂不抽取;
+- **属性和事件不产生调用边**:`x.Prop` 在 C# 里不是方法调用,`OnDead` 本身也只是
+  一个字段式成员,所以 `impact` / `refs` 对它们只给类型层面的资产依赖,不会有
+  「谁读写了它」。入库是为了让 `find` 搜得到名字、`context` 列得出签名 ——
+  而且两者恒不计入 dead-code(Unity 不序列化属性;事件的订阅点早被 `method_ref`
+  记成处理函数被引用);getter/setter 与 add/remove 体里的调用也暂不抽取;
+- **C# 语法盲点**(正则解析的已知边界,均为「漏掉该成员」而非错误结果):
+  索引器 `this[int i]` 不入库(`Owner.Member` 无法寻址,入库也查不到);
+  显式接口实现只保留最后一段名字(`IFoo.Count` → `Count`);
+  泛型实参嵌套超过两层的类型(`Dictionary<string, Dictionary<int, List<T>>>`)
+  和元组类型(`(int hp, string name) Status => …`)在属性/事件声明上匹配不到;
+  跨多行书写的声明只认「类型和名字在同一行」;
+  `#if` 条件编译不求值,两个分支的成员都会入库;
 - 字符串耦合(`SendMessage`、`transform.Find` 路径)能检出,但无法验证目标存在性;
 - 全量重建中型项目(3.75 万资产 / 6 千脚本,实测)约 8-10 分钟,`graph.db` 约 250 MB;
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
@@ -388,7 +398,7 @@ UnityEvent 绑定溯源、新人上手项目地图、**类型的完整 API 面(�
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 227 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 240 项断言全绿。
 
 历次模型评审记录见 [REVIEWS.md](REVIEWS.md)(Kimi k3 / Claude Opus 5 /
 Cursor Grok 4.6 / GPT-5.6 Sol / GLM-5.3 / DeepSeek-V4.1-Flash)。下一轮请对着

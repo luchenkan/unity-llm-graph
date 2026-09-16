@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -77,10 +78,28 @@ BUILTIN_RECEIVERS = {
 _ATTR = r"((?:[^\S\n]*\[[^\]\n]*\][^\S\n]*)*)"
 
 NS_RE = re.compile(r"^\s*namespace\s+([\w.]+)", re.MULTILINE)
+
+# 共用的类型名片段(无捕获组),给 PROPERTY_RE / EVENT_RE / DELEGATE_RE 用。
+# 覆盖 `int` / `List<Foo>` / `Dictionary<string, List<int>>` /
+# `Dictionary<K,V>.ValueCollection` / `int[]` / `string?`。
+# 旧版写法是「标识符 + 最多一次空格分隔」,`Action<int, string, bool>` 这种
+# 三参泛型会整条声明丢失(实测本项目 event 丢 11 条、property 丢 2 条)。
+# 泛型实参里只展开两层嵌套,足够真实代码;不用 `.*?` 是为了不让它跨过 `;`/`=`/`(`。
+# 泛型闭合后的 `.Member` 必须收:`Dictionary<K,V>.ValueCollection Foo => ...`
+# 这类嵌套集合类型在真实代码里不罕见(实测本项目 2 处)。
+_GEN = r"(?:[ \t]*<[^<>;={}()\n]*(?:<[^<>;={}()\n]*>[^<>;={}()\n]*)*>)?"
+_TYPE = (
+    r"[A-Za-z_][\w.]*" + _GEN +
+    r"(?:\.\w+" + _GEN + r")*"
+    r"(?:[ \t]*\[[ \t,]*\])*\??"
+)
+
 CLASS_RE = re.compile(
     _ATTR +
     r"((?:(?:public|private|protected|internal|static|abstract|sealed|partial|readonly|ref|unsafe|new)[ \t]+)*)"
-    r"\b(class|struct|interface|enum|record)[ \t]+(\w+)"
+    # `record struct` / `record class` 要排在裸 `record` 前面,否则 `record` 先命中、
+    # 名字被解析成 `struct`(关键字),整条类型进不了图。
+    r"\b(record[ \t]+struct|record[ \t]+class|class|struct|interface|enum|record)[ \t]+(\w+)"
     r"(?:[ \t]*<[^>\n{}]*>)?"
     # positional record 的参数表:`record Foo(int X, string Y);`。
     # 旧版不认这种写法,**整条类型都进不了图**(比成员丢失更严重)。
@@ -133,12 +152,19 @@ FIELD_RE = re.compile(
 #      这条是上面那条被 `[Attr]` 同行写法绕过时的兜底。
 # 用 `{` + 访问器关键字做约束(而不是只认 `{`),是为了让**无修饰符**的
 # 接口成员/私有属性也能收,同时不会把 `else {` / `try {` / `class Foo\n{` 误当属性。
+# 第三条约束在 parse_csharp 里(`_is_member_level`):声明必须直接位于类型体第一层。
+# switch 表达式的类型模式臂 `CardMainConfig config => config,` 行首、缩进、
+# 「类型 + 名字 + =>」全都合法,正则挡不住,只有花括号深度能。
 PROPERTY_RE = re.compile(
     r"^[ \t]*" + _ATTR +
+    # `ref` 必须在表里:`ref T NextNode { get; }`(UniTask 的 ITaskPoolNode 就是)
+    # 否则 `ref` 被当成类型名、`T` 被当成属性名,整条对不上后面的访问器而丢弃。
+    # `ref readonly` 由两个修饰符各匹配一次覆盖。
     r"((?:(?:public|private|protected|internal|static|abstract|virtual|override|"
-    r"sealed|new|readonly|unsafe|extern|required)[ \t]+)*)"
-    # 类型名允许一次空格分隔,覆盖 `Dictionary<string, int>` 这类带空格泛型
-    r"([\w<][\w<>\[\],.\?]*(?:[ \t]+[\w<][\w<>\[\],.\?]*)?)[ \t]+(\w+)"
+    r"sealed|new|readonly|ref|unsafe|extern|required)[ \t]+)*)"
+    r"(" + _TYPE + r")[ \t]+"
+    # 显式接口实现 `int IReadOnlyFoo.Count => ...`:名字段允许带点,取最后一段作属性名
+    r"((?:\w+[ \t]*\.[ \t]*)*\w+)"
     r"[ \t\r\n]*(?:\{[ \t\r\n]*(?:get|set|init)\b|=>)",
     re.MULTILINE,
 )
@@ -150,13 +176,17 @@ PROPERTY_RE = re.compile(
 # 注意 deadcode 不受影响:订阅点 `Foo.OnDead += Handler` 早就被 method_ref 记成
 # Handler 被引用;这里补的是**事件本身**的可发现性。
 # 两种写法都收:字段式 `event Action X;` 与自定义访问器式 `event Action X { add; remove }`。
+# 字段式还有两个变体必须认,否则整条声明丢:
+#   带初始化器 `event Action X = delegate {};`(旧版 `;` 前不许有 `=`)
+#   多声明符   `event Action A, B;`(旧版把 `Action A,` 当类型、只收到 B)
+# 表达式体 `=>` 对 event 不是合法语法,这里不收。
 EVENT_RE = re.compile(
     r"^[ \t]*" + _ATTR +
     r"((?:(?:public|private|protected|internal|static|virtual|override|abstract|"
     r"sealed|new|unsafe|extern)[ \t]+)*)"
-    r"event[ \t]+"
-    r"([\w<][\w<>\[\],.\?]*(?:[ \t]+[\w<][\w<>\[\],.\?]*)?)[ \t]+(\w+)"
-    r"[ \t\r\n]*(?:;|\{[ \t\r\n]*(?:add|remove)\b|=>)",
+    r"event[ \t]+(" + _TYPE + r")[ \t]+"
+    r"(\w+(?:[ \t]*,[ \t]*\w+)*)"
+    r"[ \t\r\n]*(?:=[^;\n]*)?(?:;|\{[ \t\r\n]*(?:add|remove)\b)",
     re.MULTILINE,
 )
 # delegate 是**类型声明**(编译器生成的委托类),不是成员。
@@ -165,8 +195,7 @@ EVENT_RE = re.compile(
 DELEGATE_RE = re.compile(
     r"^[ \t]*" + _ATTR +
     r"((?:(?:public|private|protected|internal|unsafe|new)[ \t]+)*)"
-    r"delegate[ \t]+"
-    r"([\w<][\w<>\[\],.\?]*(?:[ \t]+[\w<][\w<>\[\],.\?]*)?)[ \t]+(\w+)"
+    r"delegate[ \t]+(" + _TYPE + r")[ \t]+(\w+)"
     r"[ \t]*(?:<[^>\n]*>)?[ \t]*\(([^)]*)\)[ \t]*;",
     re.MULTILINE,
 )
@@ -297,6 +326,27 @@ def _brace_pairs(text: str) -> dict:
     return pairs
 
 
+def _brace_depths(text: str) -> Tuple[List[int], List[int]]:
+    """一次 O(n) 扫描,返回 (花括号位置列表, 该括号生效后的嵌套深度)。
+    配合 _depth_at 可以 O(log n) 查任意位置的深度 —— 用来区分
+    「类型体第一层的成员声明」和「方法体/访问器体里长得像声明的东西」。"""
+    pos: List[int] = []
+    depth: List[int] = []
+    d = 0
+    for m in re.finditer(r"[{}]", text):
+        d += 1 if m.group(0) == "{" else -1
+        pos.append(m.start())
+        depth.append(d)
+    return pos, depth
+
+
+def _depth_at(index: Tuple[List[int], List[int]], p: int) -> int:
+    """位置 p 处的花括号嵌套深度(只数严格在 p 之前的括号)。"""
+    pos, depth = index
+    i = bisect.bisect_left(pos, p)
+    return depth[i - 1] if i else 0
+
+
 def _parse_params(params: str) -> Dict[str, str]:
     """`int amount, Enemy target, ref Vector3 pos` → {amount: int, target: Enemy}。"""
     out: Dict[str, str] = {}
@@ -408,6 +458,8 @@ class CsType:
     line: int
     body_start: Optional[int] = None
     body_end: Optional[int] = None
+    decl_pos: int = -1   # 声明起始偏移,用来定位外层类型
+    outer: Optional[str] = None   # 外层类型名路径,如 `Outer` / `Outer.Mid`
     methods: List[CsMethod] = field(default_factory=list)
     fields: List[CsField] = field(default_factory=list)
     properties: List[CsProperty] = field(default_factory=list)
@@ -415,7 +467,12 @@ class CsType:
 
     @property
     def full_name(self) -> str:
-        return f"{self.namespace}.{self.name}" if self.namespace else self.name
+        # 嵌套类型必须带外层类型名。只用 `namespace.name` 时,同一命名空间下
+        # 多个类各自的嵌套 `ESteps` 会塌成同一个 full_name,成员互相混进对方名下
+        # (实测本机图谱 11612 个类型里 1231 个 full_name 重复,YooAsset.ESteps 一个
+        # 就吃掉 89 个文件的枚举值)。
+        parts = [p for p in (self.namespace, self.outer, self.name) if p]
+        return ".".join(parts)
 
     @property
     def is_mono_behaviour(self) -> bool:
@@ -542,6 +599,23 @@ def parse_csharp(text: str, path: str = "") -> CsFile:
 
     ns_matches = list(NS_RE.finditer(clean))
     braces = _brace_pairs(clean)  # 全文件一次扫描,后续 O(1) 查询
+    depth_index = _brace_depths(clean)
+
+    def _is_member_level(pos: int, owner: "CsType") -> bool:
+        """声明是否直接位于类型体的第一层。
+
+        switch 表达式的类型模式臂长得和属性/事件声明一模一样,而且同样在行首:
+            CardMainConfig cardMainConfig = args switch
+            {
+                CardInfoPageArg arg => arg.cardMainConfig,   // 「类型 名字 =>」
+            };
+        行首锚定和类型名约束都挡不住它(实测本项目 5 条幻影属性由此而来,
+        其中 3 条把内部类名注册成了 CardInfoPage 的公开属性)。方法体跨度过滤也不够 ——
+        switch 表达式同样出现在**属性的表达式体**里。只有花括号深度是通用判据。"""
+        if owner.body_start is None:
+            return False
+        return _depth_at(depth_index, pos) == _depth_at(depth_index, owner.body_start) + 1
+
     # 命名空间按出现位置近似归属:取声明位置之前最后一个 namespace
     for m in CLASS_RE.finditer(clean):
         ns = ""
@@ -558,18 +632,22 @@ def parse_csharp(text: str, path: str = "") -> CsFile:
             body_end = braces.get(body_start, len(clean))
         else:
             body_start = body_end = None
+        # `record struct Foo(...)` 里 kind 捕获到的是带空格的 `record struct`,归一空白
+        kind = " ".join(m.group(3).split())
         t = CsType(
-            name=m.group(4), kind=m.group(3), namespace=ns,
+            name=m.group(4), kind=kind, namespace=ns,
             modifiers=" ".join(m.group(2).split()),
             attributes=" ".join(m.group(1).split()),
             bases=_parse_bases(m.group(6)),   # 组 6:组 5 让给了 positional 参数表
             line=line_of(m.start()),
             body_start=body_start,
             body_end=body_end,
+            decl_pos=m.start(),
         )
         # positional record 的参数就是编译期生成的 init-only 属性,收成属性。
         # 类型经 _parse_params 归一为短名(会丢泛型实参),与接收者推断共用同一口径。
-        if m.group(3) == "record" and m.group(5):
+        # `record struct` / `record class` 也是 positional record,所以用 startswith。
+        if kind.startswith("record") and m.group(5):
             for pname, ptype in _parse_params(m.group(5)).items():
                 t.properties.append(CsProperty(
                     name=pname, type=ptype, modifiers="public",
@@ -595,8 +673,25 @@ def parse_csharp(text: str, path: str = "") -> CsFile:
             modifiers=" ".join(m.group(2).split()),
             attributes=" ".join(m.group(1).split()),
             bases=[], line=line_of(m.start()),
-            body_start=None, body_end=None,
+            body_start=None, body_end=None, decl_pos=m.start(),
         ))
+
+    # 嵌套类型的外层路径。必须在两个类型循环都跑完之后算,否则嵌套的 delegate
+    # 找不到它的外层 class。
+    _outer_cache: Dict[int, Optional[str]] = {}
+
+    def _outer_path(t: "CsType") -> Optional[str]:
+        if id(t) in _outer_cache:
+            return _outer_cache[id(t)]
+        _outer_cache[id(t)] = None          # 先占位,防御畸形嵌套导致的无限递归
+        parent = _enclosing_class(t.decl_pos, result.types)
+        if parent is not None and parent is not t:
+            up = _outer_path(parent)
+            _outer_cache[id(t)] = f"{up}.{parent.name}" if up else parent.name
+        return _outer_cache[id(t)]
+
+    for t in result.types:
+        t.outer = _outer_path(t)
 
     # 字段先行:方法体里的 `field.Method()` 需要字段声明类型才能定向
     for m in FIELD_RE.finditer(clean):
@@ -619,9 +714,12 @@ def parse_csharp(text: str, path: str = "") -> CsFile:
     # 属性访问不是调用边,而 getter 体里的调用要另开一套入口(见 README 局限)。
     for m in PROPERTY_RE.finditer(clean):
         owner = _enclosing_class(m.start(), result.types)
-        if owner is None:
+        if owner is None or not _is_member_level(m.start(), owner):
             continue
-        ptype, pname = m.group(3), m.group(4)
+        ptype = " ".join(m.group(3).split())
+        # 显式接口实现 `int IReadOnlyFoo.Count => ...`:只留最后一段当属性名,
+        # 前缀是接口名,不是属性名的一部分。
+        pname = m.group(4).replace(" ", "").replace("\t", "").rsplit(".", 1)[-1]
         if ptype in CS_KEYWORDS or pname in CS_KEYWORDS:
             continue          # get/set 已在 CS_KEYWORDS 里,单独补 init
         if pname in ("init", "add", "remove", "value"):
@@ -637,23 +735,33 @@ def parse_csharp(text: str, path: str = "") -> CsFile:
     # 事件。同样只登记可发现性,不抽 add/remove 访问器里的调用。
     for m in EVENT_RE.finditer(clean):
         owner = _enclosing_class(m.start(), result.types)
-        if owner is None:
+        if owner is None or not _is_member_level(m.start(), owner):
             continue
-        ename = m.group(4)
-        if ename in CS_KEYWORDS:
-            continue
-        owner.events.append(CsEvent(
-            name=ename, type=m.group(3),
-            modifiers=" ".join(m.group(2).split()),
-            attributes=" ".join(m.group(1).split()),
-            line=line_of(m.start()),
-            # 字段式事件以 `;` 收尾;自定义访问器式只匹配到 `{ add/remove` 就结束了
-            # (group(0) 不含收尾的 `}`),所以判据是「不是分号结尾」。
-            is_custom=not m.group(0).rstrip().endswith(";"),
-        ))
+        etype = " ".join(m.group(3).split())
+        # 字段式事件以 `;` 收尾(可能先带个 `= delegate {}` 初始化器);
+        # 自定义访问器式只匹配到 `{ add/remove` 就结束了(group(0) 不含收尾的 `}`)。
+        is_custom = not m.group(0).rstrip().endswith(";")
+        # `event Action A, B;` 一条声明多个事件,逐个登记
+        for ename in (x.strip() for x in m.group(4).split(",")):
+            if not ename or ename in CS_KEYWORDS:
+                continue
+            owner.events.append(CsEvent(
+                name=ename, type=etype,
+                modifiers=" ".join(m.group(2).split()),
+                attributes=" ".join(m.group(1).split()),
+                line=line_of(m.start()),
+                is_custom=is_custom,
+            ))
 
     field_scopes = {id(t): {f.name: short_type(f.type) for f in t.fields}
                     for t in result.types}
+    # 属性也参与接收者推断:`Inventory.Add()` 里 Inventory 是属性时,旧版 scope 里
+    # 查不到,只能靠「大写开头 = 静态调用」启发式兜底,推成同名类型或掉进 low。
+    # C# 不允许字段和属性同名,所以 setdefault 合并没有覆盖风险。
+    for t in result.types:
+        scope = field_scopes[id(t)]
+        for p in t.properties:
+            scope.setdefault(p.name, short_type(p.type))
 
     # 字段是否在类体里被读写:调用边只记方法调用,`count++` / `hp = 0` 这类
     # 纯字段访问图上看不见,不补这一步 dead-field 会几千条假阳性。

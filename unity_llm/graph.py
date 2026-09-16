@@ -998,6 +998,14 @@ def update_files(project_root: str, rel_paths) -> dict:
         if have and col not in have:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     out = {"updated": [], "deleted": [], "errors": []}
+    # 老库判定必须在插入循环**之前**取快照。属性/事件是 0.10.0 / 0.11.0 才入库的,
+    # 老库里一条都没有;但只要本次更新的文件里恰好有一个属性或事件,插完再查就有了,
+    # 提示会静默消失 —— 恰恰是「改了个带属性的脚本」这种最常见的场景漏报。
+    _had_cs = cur.execute("SELECT 1 FROM assets WHERE ext='.cs' LIMIT 1").fetchone()
+    _had_prop = cur.execute(
+        "SELECT 1 FROM members WHERE kind='property' LIMIT 1").fetchone()
+    _had_event = cur.execute(
+        "SELECT 1 FROM members WHERE kind='event' LIMIT 1").fetchone()
 
     for rel in rel_paths:
         rel = rel.replace("\\", "/").lstrip("/")
@@ -1066,16 +1074,15 @@ def update_files(project_root: str, rel_paths) -> dict:
     cur.execute(
         "INSERT OR REPLACE INTO meta_kv(key,value) VALUES ('updated_at',?)",
         (str(int(time.time())),))
-    # 属性是 0.10.0 才入库的。老库(0.9.x 建的)里 kind='property' 一条都没有,
-    # 而增量更新只重解析本次传入的文件 —— 其余几千个脚本的属性永远补不上。
-    # 这里给一次明确提示,否则现象是「升级了,但 find 还是搜不到属性/refs 还是 unknown」,
-    # 排查成本很高。用数据判定而不是 meta_kv.version:update 会把 version 覆盖成新版。
-    if not cur.execute(
-            "SELECT 1 FROM members WHERE kind='property' LIMIT 1").fetchone() \
-            and cur.execute("SELECT 1 FROM assets WHERE ext='.cs' LIMIT 1").fetchone():
-        out["hint"] = ("库中没有任何属性记录(kind='property'):这个 graph.db 是 0.10.0 "
-                       "之前的版本建的。增量更新只重解析本次传入的文件,其余脚本的属性"
-                       "补不上 —— 需要跑一次全量 build 才能看到属性。")
+    # 属性是 0.10.0、事件是 0.11.0 才入库的。老库里一条都没有,而增量更新只重解析
+    # 本次传入的文件 —— 其余几千个脚本的属性/事件永远补不上。这里给一次明确提示,
+    # 否则现象是「升级了,但 find 还是搜不到属性/refs 还是 unknown」,排查成本很高。
+    # 用数据判定而不是 meta_kv.version:update 会把 version 覆盖成新版。
+    if _had_cs and not (_had_prop and _had_event):
+        missing = "属性" if _had_event else ("事件" if _had_prop else "属性和事件")
+        out["hint"] = (f"库中没有任何{missing}记录:这个 graph.db 是旧版本建的。"
+                       "增量更新只重解析本次传入的文件,其余脚本补不上 —— "
+                       "需要跑一次全量 build。")
     conn.commit()
     conn.close()
     out["seconds"] = round(time.time() - t0, 2)

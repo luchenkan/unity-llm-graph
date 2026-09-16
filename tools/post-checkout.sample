@@ -34,16 +34,14 @@ git cat-file -e "$PREV^{commit}" 2>/dev/null || exit 0
 
 # 切分支会重写所有差异文件的 mtime,所以 --stale 能覆盖绝大部分;
 # --files 额外收那些**从未进过 file_state** 的新资产(新文件不在表里,--stale 看不见)。
-FILES=$(git diff --name-only "$PREV" HEAD 2>/dev/null \
-        | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$' || true)
-
+# 走 stdin(`--files -`)而不是命令行展开:分支间差异动辄几千个文件,
+# 未加引号的 $FILES 会被 shell 按空格再切一刀(路径带空格就散架),
+# 而且很容易撞上 argv 长度上限,hook 会静默失败。
 cd "$UNITY_LLM_DIR" 2>/dev/null || exit 0
-if [ -n "$FILES" ]; then
-    python -m unity_llm update --project "$ROOT" --stale --files $FILES \
+
+git diff --name-only "$PREV" HEAD 2>/dev/null \
+    | grep -E '\.(cs|prefab|unity|asset|controller|anim|playable|mask|preset)$' \
+    | python -m unity_llm update --project "$ROOT" --stale --files - \
         >> "$ROOT/.unity-llm/hook.log" 2>&1 &
-else
-    python -m unity_llm update --project "$ROOT" --stale \
-        >> "$ROOT/.unity-llm/hook.log" 2>&1 &
-fi
 
 exit 0
