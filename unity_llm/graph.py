@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS members (
     is_lifecycle INTEGER NOT NULL DEFAULT 0,
     is_message INTEGER NOT NULL DEFAULT 0,
     serialized INTEGER NOT NULL DEFAULT 0,
-    code_used INTEGER NOT NULL DEFAULT 0,   -- 字段:声明之外在类体里被读写过
+    code_used INTEGER NOT NULL DEFAULT 0,   -- 字段:声明之外在类体里被读写过;属性恒 0
     external INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS calls (
@@ -490,6 +490,20 @@ def _insert_csharp(cur, text: str, rel: str, guid: str, ext_flag: int) -> dict:
                 (t.full_name, "field", fld.name, f"{fld.type} {fld.name}",
                  fld.modifiers, fld.attributes, fld.type, fld.line, rel, guid,
                  0, 0, int(fld.serialized), int(fld.code_used), ext_flag))
+            n["members"] += 1
+        # 属性。serialized / code_used 恒 0:Unity 不序列化属性(序列化的是
+        # 编译器生成的 `<Hp>k__BackingField`),而 dead-code 只扫 kind='method'
+        # 和 kind='field',属性天然不进那两个榜(见 queries.dead_code)。
+        # 属性入库解决的是「可发现性」:find 能搜到名字、resolve_target 能解析
+        # Type.Prop、context 能列出接口。属性访问不是调用边,所以不产生 calls。
+        for pr in t.properties:
+            cur.execute(
+                "INSERT INTO members(owner, kind, name, signature, modifiers,"
+                " attributes, extra, line, file, guid, is_lifecycle, is_message,"
+                " serialized, code_used, external) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (t.full_name, "property", pr.name, f"{pr.type} {pr.name}",
+                 pr.modifiers, pr.attributes, pr.type, pr.line, rel, guid,
+                 0, 0, 0, 0, ext_flag))
             n["members"] += 1
     return n
 
@@ -1040,6 +1054,16 @@ def update_files(project_root: str, rel_paths) -> dict:
     cur.execute(
         "INSERT OR REPLACE INTO meta_kv(key,value) VALUES ('updated_at',?)",
         (str(int(time.time())),))
+    # 属性是 0.10.0 才入库的。老库(0.9.x 建的)里 kind='property' 一条都没有,
+    # 而增量更新只重解析本次传入的文件 —— 其余几千个脚本的属性永远补不上。
+    # 这里给一次明确提示,否则现象是「升级了,但 find 还是搜不到属性/refs 还是 unknown」,
+    # 排查成本很高。用数据判定而不是 meta_kv.version:update 会把 version 覆盖成新版。
+    if not cur.execute(
+            "SELECT 1 FROM members WHERE kind='property' LIMIT 1").fetchone() \
+            and cur.execute("SELECT 1 FROM assets WHERE ext='.cs' LIMIT 1").fetchone():
+        out["hint"] = ("库中没有任何属性记录(kind='property'):这个 graph.db 是 0.10.0 "
+                       "之前的版本建的。增量更新只重解析本次传入的文件,其余脚本的属性"
+                       "补不上 —— 需要跑一次全量 build 才能看到属性。")
     conn.commit()
     conn.close()
     out["seconds"] = round(time.time() - t0, 2)

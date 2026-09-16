@@ -65,7 +65,7 @@ def _identity(node: Dict) -> str:
     if kind == "asset":
         deleted = " [deleted]" if node.get("deleted") else ""
         return f"- asset `{node['path']}`{deleted}\n- guid `{node['guid']}`"
-    if kind in ("method", "field"):
+    if kind in ("method", "field", "property"):
         return (f"- {kind} `{node['owner']}.{node['name']}`\n"
                 f"- signature `{node['signature']}`\n- file `{node['file']}`")
     candidates = "\n".join(f"- candidate `{c}`"
@@ -76,7 +76,7 @@ def _identity(node: Dict) -> str:
 def _member_lines(conn, node: Dict) -> List[str]:
     if node["kind"] == "type":
         owner, only_name = node["full_name"], None
-    elif node["kind"] in ("method", "field"):
+    elif node["kind"] in ("method", "field", "property"):
         owner, only_name = node["owner"], node["name"]
     elif node["kind"] == "asset" and node.get("ext") == ".cs":
         row = conn.execute(
@@ -122,7 +122,8 @@ def build_context(project_root: str, target: str, budget_tokens: int = 2000,
     members = _member_lines(conn, node)
     conn.close()
 
-    critical_count = len(members) if node["kind"] in ("method", "field") else 4
+    critical_count = (len(members)
+                      if node["kind"] in ("method", "field", "property") else 4)
     critical, rest = members[:critical_count], members[critical_count:]
     parts = [
         f"# Unity context: {target}",

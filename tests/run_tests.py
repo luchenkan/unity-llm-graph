@@ -21,6 +21,7 @@
  18. parser  注释/字符串同遍遮罩(URL 里的 // 不能吃掉后面的代码)
  19. build   verbose 进度写 stderr,默认安静
  20. visual  Animator/Timeline 结构解析(缩进列表 / AnyState / 负 fileID)
+ 21. property C# 属性入库(四种写法 / Owner.Prop 解析 / LINQ lambda 不误报)
 """
 import base64
 import json
@@ -1080,6 +1081,77 @@ def test_error_report():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_properties():
+    print("[33] 属性入库(property)")
+    s = queries.stats(FIXTURE)
+    by_kind = s["members_by_kind"]
+    check("属性进入 members", by_kind.get("property", 0) >= 4, str(by_kind))
+    check("成员统计按 kind 拆分",
+          by_kind.get("method", 0) > 0 and by_kind.get("field", 0) > 0,
+          str(by_kind))
+    # find 搜得到属性名 —— 属性没入库时这一步直接返回空
+    r = queries.find_symbols(FIXTURE, "DisplayName")
+    hits = {(m["owner"], m["name"], m["kind"]) for m in r["members"]}
+    check("find 搜得到属性",
+          any(k == "property" and n == "DisplayName" for _, n, k in hits),
+          str(hits))
+    # Owner.Prop 能解析 —— 过去落 kind=unknown
+    conn = graph.connect(FIXTURE)
+    for prop in ("Hp", "IsAlive", "DisplayName", "MaxHp"):
+        res = queries.resolve_target(conn, f"Player.{prop}")
+        check(f"Player.{prop} 解析为 property",
+              res.get("kind") == "property"
+              and res.get("owner") == "Game.Combat.Player", str(res))
+    rows = {x["name"]: x for x in conn.execute(
+        "SELECT * FROM members WHERE kind='property'"
+        " AND owner='Game.Combat.Player'")}
+    check("四种写法全入库(自动/访问器体/表达式体/静态)",
+          {"Hp", "IsAlive", "DisplayName", "MaxHp"} <= set(rows),
+          str(list(rows)))
+    check("属性签名带类型",
+          rows["DisplayName"]["signature"] == "string DisplayName",
+          str(rows["DisplayName"]["signature"]))
+    check("属性恒 serialized=0(Unity 不序列化属性)",
+          all(x["serialized"] == 0 for x in rows.values()), str(rows))
+    # LINQ lambda 误报回归:真实项目上 `ToDictionary(x => x, x => ...)` 曾被吃掉
+    # (`> x, x =>` 看着就像「类型 + 名字 + =>」)。lambda 参数名是单字母。
+    lam = [x[0] for x in conn.execute(
+        "SELECT name FROM members WHERE kind='property'"
+        " AND name IN ('x','o','pair','v','e','item')")]
+    check("LINQ lambda 没被误当属性", not lam, str(lam))
+    bare = queries.resolve_target(conn, "Hp")
+    check("裸属性名不做全局猜测(重名太多,要求 Owner.Prop)",
+          bare.get("kind") != "property", str(bare))
+    bare_ok = queries.resolve_target(conn, "Game.Combat.Player.Hp")
+    check("带命名空间的 Owner.Prop 也能解析",
+          bare_ok.get("kind") == "property", str(bare_ok))
+    conn.close()
+    # refs / impact 不再 unknown
+    rr = queries.find_refs(FIXTURE, "Player.Hp")
+    check("refs 对属性不报 unknown",
+          rr["resolved"].get("kind") == "property", str(rr["resolved"]))
+    check("refs 对属性给出「0 引用正常」的提示",
+          "note_property" in rr["summary"], str(rr["summary"]))
+    imp = queries.impact(FIXTURE, "Player.Hp")
+    check("impact 对属性不报 unknown",
+          imp["resolved"].get("kind") == "property", str(imp["resolved"]))
+    check("impact 对属性给出「0 引用正常」的提示",
+          "note_property" in imp["summary"], str(imp["summary"]))
+    # context 列出属性(数据模型类的 API 面几乎全是属性)
+    text = context_mod.build_context(FIXTURE, "Player", budget_tokens=3000)
+    check("context 列出属性", "property" in text, text[:300])
+    # deadcode 不得把属性当「未使用序列化字段」
+    dc = queries.dead_code(FIXTURE)
+    fields = {f["field"] for f in dc["maybe_unused_fields"]}
+    check("属性不进「未使用字段」榜",
+          not any(x in f for f in fields
+                  for x in ("DisplayName", "IsAlive", "MaxHp", ".Hp")),
+          str(fields))
+    # 新库不该误报「老库缺属性」
+    upd = graph.update_files(FIXTURE, ["Assets/Scripts/Player.cs"])
+    check("新库 update 不误报老库提示", "hint" not in upd, str(upd.get("hint")))
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1096,7 +1168,8 @@ def main():
              test_correctness_hardening, test_atomic_build, test_hierarchy,
              test_build_progress, test_visual_assets,
              test_visual_query_end_to_end,
-             test_stale_detection, test_digest, test_usage, test_error_report]
+             test_stale_detection, test_digest, test_usage, test_error_report,
+             test_properties]
     failed = 0
     for t in tests:
         try:

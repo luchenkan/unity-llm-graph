@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io/)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-193%20assertions%20passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-213%20assertions%20passing-brightgreen.svg)](#测试)
 
 > English: A zero-dependency dependency-graph engine for Unity projects that merges the
 > **C# code graph** (classes / methods / calls / inheritance / engine lifecycle callbacks)
@@ -485,12 +485,14 @@ python tests/run_tests.py
 悬空引用体检、上下文打包、MCP 握手与 `tools/call`、**增量更新(改/增/删)**
 并覆盖 partial、namespace 重名、原子 build、tombstone、MCP profile 和严格
 token 预算,以及 **stale 检测(磁盘变更自愈/老库降级)、digest 聚合、usage
-采用率报告**。共 **193 项断言 / 32 个测试组**。
+采用率报告**、**C# 属性入库(四种写法 / `Owner.Prop` 解析 / LINQ lambda 不误报)**。
+共 **213 项断言 / 33 个测试组**。
 
 ## 能力与局限(诚实声明)
 
 **擅长:** 跨模块多跳追踪(谁调用了调用者)、改动爆炸半径、prefab/scene 引用定位、
-UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模型看签名和依赖,而不是整个文件)。
+UnityEvent 绑定溯源、新人上手项目地图、**类型的完整 API 面(方法 / 字段 / 属性)**、
+上下文瘦身(只给模型看签名和依赖,而不是整个文件)。
 
 **局限:**
 
@@ -499,11 +501,66 @@ UnityEvent 绑定溯源、新人上手项目地图、上下文瘦身(只给模�
   推不出来 —— 这些边会落到 `low` 并被默认过滤,**宁可漏报不误报**;
 - 反射、热更框架(HybridCLR / xLua / ILRuntime)、Timeline / Animation Event 入口
   **静态分析天然不可见**,dead-code 结果永远需要人工复核(工具自带免责声明);
+- **属性不产生调用边**:`x.Prop` 在 C# 里不是方法调用,所以 `impact` / `refs`
+  对属性只给类型层面的资产依赖,不会有「谁读写了它」。属性入库是为了让
+  `find` 搜得到名字、`context` 列得出签名 —— 而且属性恒不计入 dead-code
+  (Unity 不序列化属性,属性是公开 API 面);getter/setter 体里的调用也暂不抽取;
 - 字符串耦合(`SendMessage`、`transform.Find` 路径)能检出,但无法验证目标存在性;
 - 全量重建中型项目(3.75 万资产 / 6 千脚本,实测)约 8-10 分钟,`graph.db` 约 250 MB;
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
 
 ## Changelog
+
+### 0.10.0
+
+主题:**C# 属性(property)入库**。此前属性完全不在图里 —— 而数据模型类的 API 面几乎全是属性。
+
+起因是在一个 4.4 万资产 / 1.1 万脚本的真实项目上量出来的:源码里 **7700+ 条属性声明**
+(独立正则口径 6400+),而 `members.kind` 只有 `method` / `field`,`property` 一条都没有。
+后果具体到工具:`unity_find`(该项目**最高频**的 MCP 工具,占 65% 调用)搜属性名返回空、
+`unity_refs PlayerModel.FirstSelectIPID` 解析成 `resolved_kind: unknown`、
+`unity_context` 列不出属性签名。
+
+- **解析**:`csharp.py` 新增 `PROPERTY_RE` + `CsProperty`,三种写法都收 ——
+  自动属性 `{ get; private set; }`、访问器体、表达式体 `=> expr`;无修饰符的
+  接口成员(实测该项目 194 条)也覆盖。
+- **两条防误报约束**(实测踩到才加的):`^[ \t]*` **行首锚定** —— 否则 LINQ lambda
+  会被整片吃掉,`ToDictionary(x => x, x => ...)` 里的 `> x, x =>` 看着就像
+  「类型 + 名字 + `=>`」(该项目单文件就有 3 条这类假属性);类型首字符限 `[\w<]`
+  作兜底。加约束后该项目命中数 8927 → 7779,**类型首字符异常 0 条**。
+- **入库**:`members.kind='property'`,复用已有列,**无 schema 变更**。
+  `serialized` / `code_used` 恒 0 —— Unity 不序列化属性(序列化的是编译器生成的
+  `<Hp>k__BackingField`),而 dead-code 只扫 `method` / `field`,属性天然不进
+  「未使用字段」榜。
+- **查询打通**:`resolve_target` 支持 `Owner.Prop`,与字段一样**要求带 owner**
+  (`Name` / `Id` / `Count` 这类属性名重名率太高,不做全局猜测);`impact` /
+  `refs` / `components` 的 kind 白名单统一加 `property`;`context` 本来就不按
+  kind 过滤 members,属性自动出现在接口列表里。
+- **`stats` 新增 `members_by_kind`**:method / field / property 分项计数。
+- **老库提示**:属性只对**被重解析过**的文件生效,而增量 `update` 只处理传入的
+  文件 —— 0.9.x 建的库跑 `update` 后属性仍为空。`update` 结尾会检测「库中
+  property 为 0 但有 .cs 资产」并提示**需要一次全量 build**,避免「升级了但
+  find 还是搜不到属性」这种无声失败。
+- 测试 193 → **213 项断言 / 33 组**。
+
+**实测**(4.4 万资产 / 1.1 万脚本的商业项目,全量 rebuild 6m12s):
+
+| 查询 | 升级前 | 升级后 |
+| --- | --- | --- |
+| `members_by_kind` 里的 property | **0** | **11459** |
+| `find FirstSelectIPID` | 空结果 | 命中 `PlayerModel`(kind=property) |
+| `refs PlayerModel.FirstSelectIPID` | `resolved_kind: unknown` | `kind=property`,签名 `int FirstSelectIPID` |
+| `context PlayerModel` | 只有方法,没有属性 | `## Key signatures` 列出属性 |
+| deadcode | — | 属性不进任何榜,计数无激增 |
+| 解析开销 | — | **+1.5%**(1200 文件 7.92s vs 7.80s) |
+
+属性天然没有调用方,极易被读成「没人用、可以删」。`refs` / `impact` 命中属性时
+会带 `note_property` 说明这是语言事实:「调用方为 0」是正常的,不构成删除依据。
+
+**诚实局限**:属性访问(`x.Prop`)在 C# 里**不是调用边**,所以属性不会有
+`impact` / `refs` 的调用方 —— 这是语言事实,不是图谱缺陷。属性入库解决的是
+**可发现性**(找得到名字、拿得到签名),不是「谁读写了这个属性」;getter/setter
+体里的调用也暂不抽取(需要另开一套入口)。
 
 ### 0.9.1
 
@@ -714,11 +771,11 @@ fileID 对象图:
 
 ## 贡献
 
-Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 193 项断言全绿。
+Issue 和 PR 都欢迎。改动前请先跑 `python tests/run_tests.py` 确保 213 项断言全绿。
 
 历次模型评审记录见 [REVIEWS.md](REVIEWS.md)(Kimi k3 / Claude Opus 5 /
-Cursor Grok 4.6 / GPT-5.6 Sol)。下一轮请对着真实项目和 `calls.log` 审,
-不要只打 fixture。
+Cursor Grok 4.6 / GPT-5.6 Sol / GLM-5.3 / DeepSeek-V4.1-Flash)。下一轮请对着
+真实项目和 `calls.log` 审,不要只打 fixture。
 
 ## License
 

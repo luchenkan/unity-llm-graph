@@ -2,7 +2,7 @@
 
 Brief for later reviewers. Do not treat README or the 5-script fixture as the product.
 
-Framework: **unity-llm-graph** `0.7.0`  
+Framework: **unity-llm-graph** `0.10.0`  
 Repo: https://github.com/luchenkan/unity-llm-graph
 Constraint: zero runtime deps, Python ≥ 3.9, stdlib only.
 
@@ -30,6 +30,7 @@ Two MCP servers can and should run together: this one answers “what is coupled
 | 6 | GPT-5.6 Sol | Re-prioritized correctness before token claims; patched namespace resolution, dead-code false negatives, deletion tombstones, strict context budgets, MCP profiles, and atomic builds for 0.6.0. |
 | 7 | DeepSeek-V4-Pro | Reviewed **adoption**, not the fixture: read a production project's `calls.log`, token ledger, hook config, and a competing Editor MCP. Found Grok 4.6's diagnosis was still unfixed, then patched 0.7.0 to take the Editor MCP's "list hierarchy / components" query off the table. |
 | 9 | GLM-5.3 | Author of 0.7.3 (pull/merge/rebase auto-refresh hooks) and 0.8.0 (stale detection, `digest`, `usage`, error self-correction). Works daily on the same production project. |
+| 10 | DeepSeek-V4.1-Flash | Reviewed the production project's `calls.log` (again, not the fixture) and found the **property blind spot**: `members.kind` had no `property` at all. Shipped 0.10.0. |
 
 Round 5 is the first pass that measured **which tools models actually invoked**, and that rejected encoding one game’s bus type into the engine.
 
@@ -50,21 +51,24 @@ Round 5 is the first pass that measured **which tools models actually invoked**,
 - **Cursor ≠ Claude Code MCP paths.** Project-root `.mcp.json` does not mean Cursor loaded the server.
 - Round 5 first pass over-fit a project event bus name into MCP copy. That was reverted: the engine now matches **`Type.Field.Method()`** (PascalCase type, any method), kind `field_call`. Old kind `relay` is still read for stale DBs.
 
-## Current shape (`0.7.0`)
+## Current shape (`0.10.0`)
 
 ```
-meta.py        guid ← .meta and/or guidmap.tsv
-unity_yaml.py  guid refs + UnityEvent + GameObject name via m_GameObject
-               + fileID object graph (Transform m_Father, component m_GameObject)
-csharp.py      types/methods/fields, lifecycle, string APIs, method_ref, field_call
-graph.py       SQLite union + call resolution + is_mono inheritance walk
-               + objects table (fileID object graph)
-queries.py     impact / refs / components (with hierarchy tree) / deadcode /
-               find / validate
-mcp_server.py  10 tools split into core/full/admin profiles
+meta.py          guid ← .meta and/or guidmap.tsv
+unity_yaml.py    guid refs + UnityEvent + GameObject name via m_GameObject
+                 + fileID object graph (Transform m_Father, component m_GameObject)
+csharp.py        types / methods / fields / properties, lifecycle, string APIs,
+                 method_ref, field_call
+visual_assets.py Animator state machines + Timeline tracks/clips
+graph.py         SQLite union + call resolution + is_mono inheritance walk
+                 + objects table + file_state (staleness) + atomic build
+queries.py       impact / refs / components (with hierarchy tree) / deadcode /
+                 find / validate / animator / timeline / digest / usage /
+                 error_report
+mcp_server.py    tools split into core/full/admin profiles
 ```
 
-Tests: 142 assertions / 25 groups on `tests/fixtures/SampleProject`.
+Tests: 213 assertions / 33 groups on `tests/fixtures/SampleProject`.
 
 ## Open questions for the next model
 
@@ -246,3 +250,115 @@ without the report.
 
 Tests: 172 → **186 assertions / 31 groups**, all green; real-project smoke
 tests for stale downgrade, digest and usage documented above.
+
+## Round 10 — the property blind spot (0.10.0)
+
+Reviewed by **DeepSeek-V4.1-Flash** (WorkBuddy), against the same real
+~44k-asset / 11k-script production project rather than the fixture.
+
+### Starting from what the log got wrong, not from what the code lacks
+
+Rounds 5/7/9 established the method: read `calls.log`, do not trust the README.
+Doing that again, `usage` reported:
+
+```
+unity_find 15 (65%)  unity_context 4  unity_components 2  unity_impact 1  unity_refs 1
+```
+
+`unity_find` is the dominant tool, and the log held two entries that look like
+one-offs but were systematic:
+
+- `unity_refs target=PlayerModel.FirstSelectIPID` → `resolved_kind: unknown`
+- `unity_find pattern=<a property name>` → empty
+
+Both trace to the same root: `members.kind` only ever held `method` / `field`.
+
+| measure | count |
+| --- | --- |
+| property declarations in source (parser) | **7723** |
+| … of which modifier-less interface members | 194 |
+| … expression-bodied (`=>`) | 1724 |
+| rows with `kind='property'` in `members` | **0** |
+
+That is ~6.8% of all members, and effectively the whole API surface of the data
+model layer: `find` could not find the name, `refs Type.Prop` degraded to
+`unknown`, `context` showed half an interface.
+
+Notably this was **not** an oversight of the parser's authors — `FIELD_RE`
+already carried the comment *"表达式体属性 `public float X => _x;` 不是字段"*.
+Properties had been deliberately kept out of the *field* bucket but never given
+a bucket of their own. "Rather miss than invent" became "invisible".
+
+### The one part that needed thought: over-collect vs. collect-wrong
+
+The first cut (no line anchor, unconstrained first char of the type) collected
+**8927** property matches on this project. Auditing every "suspicious" match
+found 3 real false positives, all the same shape — LINQ lambdas:
+
+```csharp
+names.ToDictionary(x => x, x => x + "-hit");
+//                   ^^^^^^^^^^  `> x, x =>` reads as "type `> x,` + name `x` + `=>`"
+```
+
+The three sites were `ToDictionary(x => x, x => …)`,
+`ToDictionary(x => x.Key, x => …)`, `.ToLookup(o => o.Key, pair => …)` — all in
+one file, all mid-line. Two **independent** constraints fixed it: `^[ \t]*`
+line anchoring (a legal property declaration always starts a line) and
+restricting the type's first char to `[\w<]` as a backstop. Result: 8927 → 7779,
+zero type-anomalies, all three lambda sites gone.
+
+**This is the one lossy decision worth re-auditing**: line anchoring means two
+property declarations on one line would be missed. Not observed in the wild.
+
+### Measured on the production project (full rebuild, 6m12s)
+
+| query | before | after |
+| --- | --- | --- |
+| `members_by_kind.property` | **0** | **11459** |
+| `find FirstSelectIPID` | empty | hits `PlayerModel`, `kind=property` |
+| `refs PlayerModel.FirstSelectIPID` | `resolved_kind: unknown` | `kind=property`, signature `int FirstSelectIPID` |
+| `context PlayerModel` | methods only | properties listed under `## Key signatures` |
+| `dead_code` | — | properties in neither list; no spike |
+| parse cost | — | **+1.5%** (1200 files, 7.92s vs 7.80s) |
+
+The parse-cost number matters because the rebuild log showed a suspicious gap
+(833→1344 scripts taking 106s, i.e. ~5 files/s instead of ~170). An A/B on 1200
+real files with `PROPERTY_RE` swapped for a never-matching pattern cleared it:
+the regression is **1.5%, not 20×**. The slow window was disk/IO or one of the
+other parse stages, not this feature. Anyone re-measuring should A/B rather than
+reason from the progress log — the log prints only on counter change, so a stall
+looks like a slow feature.
+
+One design addition that the measurement made necessary: because properties
+**structurally** have no call edges, `refs` / `impact` on a property return zero
+callers. Round 6 already learned that a bare "0 dependents" gets misread as
+"safe to delete", so both now attach `note_property` explaining that the zero is
+a language fact, not evidence.
+
+### Deliberately not done
+
+- **No call edges from getter/setter bodies.** `public int X { get { return Foo(); } }`
+  still hides `Foo()` from the call graph, so `Foo` remains exposed to false
+  dead-code reports. That problem **predates 0.10.0**; this round neither widened
+  nor fixed it. It needs its own entry point.
+- **No property-access edges** (`x.Prop`). Property access is not a method call in
+  C#; manufacturing an edge would only create fake dependencies. What properties
+  buy is *discoverability*, and that is stated as an explicit limitation in the
+  README rather than papered over.
+- **Properties stay out of dead-code.** They are public API surface and Unity does
+  not serialize them; both `dead_code` lists select by kind whitelist, so
+  properties are structurally excluded (test asserts this).
+
+### Checklist for the next reviewer
+
+1. Run `stats` on a real project: is `members_by_kind.property` the same order of
+   magnitude as the source count? (7700+ here. An order-of-magnitude gap means a
+   whole syntax form is being missed.)
+2. Spot-check `context <a data-model class>` — properties should appear under
+   `## Key signatures`, ordered lifecycle > serialized > public > rest.
+3. Re-audit the lossy part of line anchoring: grep for two declarations on one line.
+4. Exercise the old-DB upgrade path: does the `update` hint fire, and does it go
+   away after a full `build`?
+5. Syntax forms still not covered: **indexers** (`this[int]`, deliberately out) and
+   **explicit interface implementations** (`int IFoo.Hp => …`, currently collected
+   as an ordinary property).

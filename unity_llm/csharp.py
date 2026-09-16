@@ -101,6 +101,35 @@ FIELD_RE = re.compile(
     # `=(?!>)`:表达式体属性 `public float X => _x;` 不是字段,不能当序列化字段
     r"([\w<>\[\],.\?]+)[ \t]+(\w+)[ \t]*(?:=(?!>)[^;\n]*)?;"
 )
+# 属性(property)。**Unity 不序列化属性** —— 序列化的是编译器生成的
+# backing field(`<Hp>k__BackingField`),名字和属性名不同,图谱本来就抓不到。
+# 所以属性恒 serialized=0,也永远不进 dead-code 的「未使用序列化字段」判定
+# (见 queries.dead_code 里的 kind 白名单)。
+# 但属性是 C# 类型的主要 API 面:数据模型类(PlayerModel 这类)几乎全是属性,
+# 缺了它们 `unity_find` 搜不到名字、`refs Type.Prop` 解析成 unknown、
+# `unity_context` 少掉半张接口表。三种写法都要收:
+#   自动属性 `public int Hp { get; private set; }`
+#   访问器体 `public int Hp { get { ... } }`
+#   表达式体 `public int Hp => _hp;`
+# 判据:名字后面必须是 `{`(且紧跟 get/set/init 访问器关键字)或 `=>`;
+# 带 `(` 的是方法,留给 METHOD_RE/METHOD_RE2。
+# 两条防误报约束,缺一不可(实测某 4.5k 脚本项目):
+#   1. `^[ \t]*` 行首锚定 —— 否则 LINQ lambda 会被整片吃掉:
+#      `ToDictionary(x => x, x => ...)` 里的 `> x, x =>` 看着就像
+#      「类型 `> x,` + 名字 `x` + `=>`」。合法的属性声明总在行首。
+#   2. 类型首字符限 `[\w<]` —— 合法类型名不会以 `>`/`,`/`.` 开头,
+#      这条是上面那条被 `[Attr]` 同行写法绕过时的兜底。
+# 用 `{` + 访问器关键字做约束(而不是只认 `{`),是为了让**无修饰符**的
+# 接口成员/私有属性也能收,同时不会把 `else {` / `try {` / `class Foo\n{` 误当属性。
+PROPERTY_RE = re.compile(
+    r"^[ \t]*" + _ATTR +
+    r"((?:(?:public|private|protected|internal|static|abstract|virtual|override|"
+    r"sealed|new|readonly|unsafe|extern|required)[ \t]+)*)"
+    # 类型名允许一次空格分隔,覆盖 `Dictionary<string, int>` 这类带空格泛型
+    r"([\w<][\w<>\[\],.\?]*(?:[ \t]+[\w<][\w<>\[\],.\?]*)?)[ \t]+(\w+)"
+    r"[ \t\r\n]*(?:\{[ \t\r\n]*(?:get|set|init)\b|=>)",
+    re.MULTILINE,
+)
 CALL_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
 DOTCALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
 # Type.Field.Method() —— 静态字段/单例上的链式调用。
@@ -289,6 +318,23 @@ class CsField:
 
 
 @dataclass
+class CsProperty:
+    """C# 属性。只用于「这个类型对外有哪些 API」的可发现性。
+
+    属性访问(`x.Prop`)在 C# 里**不是调用边**,不产生 calls 记录 ——
+    所以属性不会有 impact/refs 的调用方,这是语言事实而不是图谱缺陷。
+    serialized 恒为 False:Unity 序列化的是编译器生成的 backing field,
+    名字是 `<Hp>k__BackingField`,与属性名不同,图谱也不该把它算作属性被序列化。
+    """
+    name: str
+    type: str
+    modifiers: str
+    attributes: str
+    line: int
+    is_expression: bool = False   # 表达式体 `X => expr`(无访问器块)
+
+
+@dataclass
 class CsType:
     name: str
     kind: str            # class / struct / interface / enum / record
@@ -301,6 +347,7 @@ class CsType:
     body_end: Optional[int] = None
     methods: List[CsMethod] = field(default_factory=list)
     fields: List[CsField] = field(default_factory=list)
+    properties: List[CsProperty] = field(default_factory=list)
 
     @property
     def full_name(self) -> str:
@@ -466,6 +513,25 @@ def parse_csharp(text: str, path: str = "") -> CsFile:
         owner.fields.append(CsField(
             name=fname, type=ftype, modifiers=mods, attributes=attrs,
             line=line_of(m.start()), serialized=serialized,
+        ))
+
+    # 属性。只登记「类型对外有哪些 API」,不抽 getter/setter 里的调用 ——
+    # 属性访问不是调用边,而 getter 体里的调用要另开一套入口(见 README 局限)。
+    for m in PROPERTY_RE.finditer(clean):
+        owner = _enclosing_class(m.start(), result.types)
+        if owner is None:
+            continue
+        ptype, pname = m.group(3), m.group(4)
+        if ptype in CS_KEYWORDS or pname in CS_KEYWORDS:
+            continue          # get/set 已在 CS_KEYWORDS 里,单独补 init
+        if pname in ("init", "add", "remove", "value"):
+            continue
+        owner.properties.append(CsProperty(
+            name=pname, type=ptype,
+            modifiers=" ".join(m.group(2).split()),
+            attributes=" ".join(m.group(1).split()),
+            line=line_of(m.start()),
+            is_expression=m.group(0).rstrip().endswith("=>"),
         ))
 
     field_scopes = {id(t): {f.name: short_type(f.type) for f in t.fields}
