@@ -183,6 +183,24 @@ CREATE TABLE IF NOT EXISTS file_state (
     mtime REAL NOT NULL,          -- 「磁盘已改、图谱还是旧的」——stale 检测
     size INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS prefab_mods (
+    src_guid TEXT NOT NULL,       -- 覆盖清单所在的 prefab(variant / 父级)
+    src_path TEXT NOT NULL,
+    source_guid TEXT NOT NULL,    -- 被嵌套的源 prefab guid(m_SourcePrefab)
+    target_fileid INTEGER NOT NULL,   -- 源 prefab 内被覆盖对象的 fileID
+    property_path TEXT NOT NULL,      -- 被改写的字段名
+    value TEXT NOT NULL DEFAULT '',
+    obj_fileid INTEGER NOT NULL DEFAULT 0,
+    obj_guid TEXT NOT NULL DEFAULT ''  -- objectReference 的资产 guid(可空)
+);
+CREATE TABLE IF NOT EXISTS mb_fields (
+    src_guid TEXT NOT NULL,       -- prefab/scene guid
+    fileid INTEGER NOT NULL,      -- MonoBehaviour 文档的 fileID
+    field TEXT NOT NULL,          -- YAML 里出现过的序列化字段名
+    shape TEXT NOT NULL,          -- ref_external / ref_internal / scalar / empty
+    target_fileid INTEGER NOT NULL DEFAULT 0,
+    target_guid TEXT NOT NULL DEFAULT ''
+);
 """
 
 INDEX_SCHEMA = """
@@ -203,6 +221,11 @@ CREATE INDEX IF NOT EXISTS idx_objects_go ON objects(src_guid, go_fileid);
 CREATE INDEX IF NOT EXISTS idx_animator_states_src ON animator_states(src_guid);
 CREATE INDEX IF NOT EXISTS idx_timeline_tracks_src ON timeline_tracks(src_guid);
 CREATE INDEX IF NOT EXISTS idx_timeline_clips_track ON timeline_clips(track_fileid);
+CREATE INDEX IF NOT EXISTS idx_prefab_mods_src ON prefab_mods(src_guid);
+CREATE INDEX IF NOT EXISTS idx_prefab_mods_source ON prefab_mods(source_guid);
+CREATE INDEX IF NOT EXISTS idx_prefab_mods_obj ON prefab_mods(obj_guid);
+CREATE INDEX IF NOT EXISTS idx_mb_fields_src ON mb_fields(src_guid);
+CREATE INDEX IF NOT EXISTS idx_mb_fields_fid ON mb_fields(src_guid, fileid);
 """
 
 # 同名方法在超过这么多类型里出现,就算「热名字」:接收者类型未知时
@@ -521,9 +544,9 @@ def _insert_csharp(cur, text: str, rel: str, guid: str, ext_flag: int) -> dict:
 
 
 def _insert_yaml(cur, text: str, rel: str, guid: str) -> dict:
-    """解析并写入一个 Unity YAML 资产,返回 {refs, events} 计数。"""
+    """解析并写入一个 Unity YAML 资产,返回 {refs, events, objects, mods, keys} 计数。"""
     yf = parse_unity_yaml(text)
-    n = {"refs": 0, "events": 0, "objects": 0}
+    n = {"refs": 0, "events": 0, "objects": 0, "mods": 0, "keys": 0}
     for doc in yf.docs:
         go_name = yf.game_object_name(doc.go_fileid) if doc.go_fileid else ""
         ctx = go_name or doc.name or doc.class_name
@@ -549,6 +572,24 @@ def _insert_yaml(cur, text: str, rel: str, guid: str) -> dict:
                 [(guid, rel, e.field, e.method, e.target_type,
                   e.target_guid or "", ctx) for e in doc.events])
             n["events"] += len(doc.events)
+        if doc.class_id == 1001 and doc.mods:
+            # 嵌套 prefab / variant 的字段覆盖:引用的唯一出处
+            src = doc.prefab_source_guid or ""
+            cur.executemany(
+                "INSERT INTO prefab_mods(src_guid, src_path, source_guid,"
+                " target_fileid, property_path, value, obj_fileid, obj_guid)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                [(guid, rel, src, m.target_fileid, m.property_path, m.value,
+                  m.obj_fileid, m.obj_guid or "") for m in doc.mods])
+            n["mods"] += len(doc.mods)
+        if doc.class_id == 114 and doc.keys:
+            # MonoBehaviour 序列化字段的出现记录,供「接线审计」与 C# 侧对差
+            cur.executemany(
+                "INSERT INTO mb_fields(src_guid, fileid, field, shape,"
+                " target_fileid, target_guid) VALUES (?,?,?,?,?,?)",
+                [(guid, doc.file_id, k.field, k.shape, k.target_fileid,
+                  k.target_guid or "") for k in doc.keys])
+            n["keys"] += len(doc.keys)
     return n
 
 
@@ -1026,6 +1067,10 @@ def update_files(project_root: str, rel_paths) -> dict:
             cur.execute(f"DELETE FROM {table} WHERE {col}=?", (rel,))
         if old_asset:
             cur.execute("DELETE FROM objects WHERE src_guid=?",
+                        (old_asset["guid"],))
+            cur.execute("DELETE FROM prefab_mods WHERE src_guid=?",
+                        (old_asset["guid"],))
+            cur.execute("DELETE FROM mb_fields WHERE src_guid=?",
                         (old_asset["guid"],))
             # 视觉结构(状态机/轨道/clip)也按 guid 清,不然改过的 controller/playable
             # 会留下旧状态 + 新状态两份

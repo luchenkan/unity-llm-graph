@@ -52,6 +52,38 @@ EVENT_TARGET_RE = re.compile(
 _EVENT_INTERNAL_KEYS = {"m_PersistentCalls", "m_Calls", "m_Arguments",
                         "m_Target", "m_Mode", "m_CallState", "m_Delegates"}
 
+# ---------------------------------------------------------------- 嵌套 prefab
+# PrefabInstance(classID 1001)= 嵌套 prefab 实例 / prefab variant。它本身不带
+# 组件,只带一份「覆盖清单」:源 prefab 里哪个对象的哪个 propertyPath 被改写了。
+# 引用关系写在 objectReference 上 —— 这是嵌套实例引用的**唯一**出处,
+# 旧版只扫 `{fileID, guid}` 的 REF_RE 会把 field 推成 "objectReference",
+# 语义丢失;更常见的是 objectReference 只有 fileID(无 guid),整条被丢弃,
+# 于是「这个嵌套 prefab 的字段指向谁」查不到(09-02 实测返回空)。
+PREFAB_SOURCE_RE = re.compile(
+    r"^\s*m_SourcePrefab:\s*\{fileID:\s*(-?\d+),\s*guid:\s*(" + _GUID_BODY + r")",
+    re.MULTILINE)
+MOD_TARGET_RE = re.compile(
+    r"^\s*- target:\s*\{fileID:\s*(-?\d+),\s*guid:\s*(" + _GUID_BODY + r")[^}]*\}",
+    re.MULTILINE)
+MOD_PATH_RE = re.compile(r"^\s*propertyPath:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+MOD_VALUE_RE = re.compile(r"^\s*value:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+MOD_OBJREF_RE = re.compile(
+    r"^\s*objectReference:\s*\{fileID:\s*(-?\d+)"
+    r"(?:,\s*guid:\s*(" + _GUID_BODY + r"))?", re.MULTILINE)
+
+# MonoBehaviour 的顶层序列化字段(缩进恰好 2 空格)。只记「出现过哪些 key」,
+# 不解释值 —— 与 C# 侧的 serialized 字段名对差,才能区分
+# 「真断链」和「运行时才赋值的缓存字段」。
+MB_KEY_RE = re.compile(r"^  ([A-Za-z_]\w*):(.*)$", re.MULTILINE)
+# 嵌套 prefab 实例的 stripped 占位标记(不是真字段名)
+STRIPPED_KEY = "__stripped__"
+# Unity 内置字段,不属于任何 C# 字段,比对时天然不在 serialized 集合里
+MB_BUILTIN_KEYS = {
+    "m_ObjectHideFlags", "m_PrefabInstance", "m_PrefabAsset", "m_GameObject",
+    "m_Enabled", "m_EditorHideFlags", "m_Script", "m_Name",
+    "m_EditorClassIdentifier", "serializedVersion",
+}
+
 # 常见 classID 对照(报告时友好显示)
 CLASS_NAMES = {
     1: "GameObject", 4: "Transform", 20: "Camera", 23: "MeshRenderer",
@@ -87,6 +119,37 @@ class YamlEvent:
 
 
 @dataclass
+class YamlMod:
+    """PrefabInstance 的一条字段覆盖(m_Modifications 的一项)。
+
+    target_guid 是**源 prefab** 的 guid,obj_guid 才是被引用资产的 guid ——
+    两者不同,别混。
+    """
+    target_fileid: int
+    target_guid: str
+    property_path: str
+    value: str = ""
+    obj_fileid: int = 0
+    obj_guid: Optional[str] = None
+
+
+@dataclass
+class YamlKey:
+    """MonoBehaviour 序列化字段在 YAML 里的出现记录。
+
+    shape:
+      ref_external  {fileID: n, guid: g}  跨资产引用(可验证 guid 是否存在)
+      ref_internal  {fileID: n}           文件内引用(可验证 fileID 是否存在)
+      scalar        普通标量(已赋值)
+      empty         空值 / null(未赋值)
+    """
+    field: str
+    shape: str
+    target_fileid: int = 0
+    target_guid: Optional[str] = None
+
+
+@dataclass
 class YamlDoc:
     class_id: int
     file_id: int
@@ -97,6 +160,9 @@ class YamlDoc:
     father_fileid: Optional[int] = None    # 仅 Transform: 父 Transform 的 fileID(0=根)
     refs: List[YamlRef] = field(default_factory=list)
     events: List[YamlEvent] = field(default_factory=list)
+    mods: List[YamlMod] = field(default_factory=list)   # 仅 PrefabInstance
+    keys: List[YamlKey] = field(default_factory=list)   # 仅 MonoBehaviour
+    prefab_source_guid: Optional[str] = None            # 仅 PrefabInstance
 
     @property
     def class_name(self) -> str:
@@ -182,6 +248,58 @@ def _extract_events(body: str) -> List[YamlEvent]:
     return out
 
 
+def _extract_mods(body: str) -> "tuple[List[YamlMod], Optional[str]]":
+    """抽取 PrefabInstance 的源 prefab guid 与字段覆盖清单。
+
+    按 `- target:` 切块再在块内找 propertyPath / value / objectReference,
+    而不是一条大正则 —— value 可能为空行,四行未必总齐全。
+    """
+    out: List[YamlMod] = []
+    starts = [m.start() for m in MOD_TARGET_RE.finditer(body)]
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(body)
+        chunk = body[s:e]
+        tm = MOD_TARGET_RE.match(chunk)
+        if not tm:
+            continue
+        pm = MOD_PATH_RE.search(chunk)
+        vm = MOD_VALUE_RE.search(chunk)
+        om = MOD_OBJREF_RE.search(chunk)
+        out.append(YamlMod(
+            target_fileid=int(tm.group(1)),
+            target_guid=tm.group(2),
+            property_path=pm.group(1).strip().strip('"') if pm else "",
+            value=vm.group(1).strip().strip('"') if vm else "",
+            obj_fileid=int(om.group(1)) if om else 0,
+            obj_guid=om.group(2) if om else None,
+        ))
+    sm = PREFAB_SOURCE_RE.search(body)
+    return out, (sm.group(2) if sm else None)
+
+
+def _extract_mb_keys(body: str) -> List[YamlKey]:
+    """抽取 MonoBehaviour 顶层出现过的序列化字段名与值形状。"""
+    out: List[YamlKey] = []
+    for m in MB_KEY_RE.finditer(body):
+        name, raw = m.group(1), m.group(2)
+        if name in MB_BUILTIN_KEYS:
+            continue
+        raw = raw.strip()
+        rm = re.match(r"\{fileID:\s*(-?\d+)(?:,\s*guid:\s*(" + _GUID_BODY + r"))?",
+                      raw)
+        if rm:
+            out.append(YamlKey(
+                field=name,
+                shape="ref_external" if rm.group(2) else "ref_internal",
+                target_fileid=int(rm.group(1)),
+                target_guid=rm.group(2)))
+        elif raw in ("", "{}", "null"):
+            out.append(YamlKey(field=name, shape="empty"))
+        else:
+            out.append(YamlKey(field=name, shape="scalar"))
+    return out
+
+
 def parse_unity_yaml(text: str) -> UnityYamlFile:
     """解析一份 prefab / scene / .asset 的文本。"""
     result = UnityYamlFile()
@@ -222,5 +340,13 @@ def parse_unity_yaml(text: str) -> UnityYamlFile:
                                     file_id=fid, guid=guid))
         if "m_MethodName:" in body:
             doc.events = _extract_events(body)
+        if doc.class_id == 1001:
+            doc.mods, doc.prefab_source_guid = _extract_mods(body)
+        elif doc.class_id == 114:
+            # stripped 文档是嵌套 prefab 实例的占位:只剩 m_Script 等骨架,
+            # 真正的字段值在源 prefab 里。写一条哨兵,让查询侧知道「这里审不出
+            # 东西,别把源 prefab 的字段算成本文件的 missing」。
+            doc.keys = ([YamlKey(field=STRIPPED_KEY, shape="stripped")]
+                        if doc.stripped else _extract_mb_keys(body))
         result.docs.append(doc)
     return result

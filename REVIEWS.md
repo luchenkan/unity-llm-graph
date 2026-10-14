@@ -2,7 +2,7 @@
 
 Brief for later reviewers. Do not treat README or the 5-script fixture as the product.
 
-Framework: **unity-llm-graph** `0.11.0`  
+Framework: **unity-llm-graph** `0.12.0`  
 Repo: https://github.com/luchenkan/unity-llm-graph
 Constraint: zero runtime deps, Python ≥ 3.9, stdlib only.
 
@@ -32,6 +32,7 @@ Two MCP servers can and should run together: this one answers “what is coupled
 | 9 | GLM-5.3 | Author of 0.7.3 (pull/merge/rebase auto-refresh hooks) and 0.8.0 (stale detection, `digest`, `usage`, error self-correction). Works daily on the same production project. |
 | 10 | DeepSeek-V4.1-Flash | Reviewed the production project's `calls.log` (again, not the fixture) and found the **property blind spot**: `members.kind` had no `property` at all. Shipped 0.10.0. |
 | 11 | DeepSeek-V4.1-Flash | Ran a **declaration-coverage census** on the production project instead of reading the README's TODOs: found `event` / `delegate` / positional `record` missing, and — more valuable — that `x?.Foo()` (1772 call sites) was never a call edge. Shipped 0.11.0. |
+| 12 | GLM (阿墨) | Re-prioritized by **what the project's shifting requirements actually cost in human time**, not by the README's roadmap order. Measured `calls.log` first (animator/timeline = zero invocations), then picked the single most manual step from that day's audit. Shipped 0.12.0. |
 
 Round 5 is the first pass that measured **which tools models actually invoked**, and that rejected encoding one game’s bus type into the engine.
 
@@ -52,24 +53,58 @@ Round 5 is the first pass that measured **which tools models actually invoked**,
 - **Cursor ≠ Claude Code MCP paths.** Project-root `.mcp.json` does not mean Cursor loaded the server.
 - Round 5 first pass over-fit a project event bus name into MCP copy. That was reverted: the engine now matches **`Type.Field.Method()`** (PascalCase type, any method), kind `field_call`. Old kind `relay` is still read for stale DBs.
 
-## Current shape (`0.11.0`)
+## Current shape (`0.12.0`)
 
 ```
 meta.py          guid ← .meta and/or guidmap.tsv
 unity_yaml.py    guid refs + UnityEvent + GameObject name via m_GameObject
                  + fileID object graph (Transform m_Father, component m_GameObject)
+                 + PrefabInstance m_SourcePrefab / m_Modifications
+                 + MonoBehaviour serialized-key census (mb_fields, stripped sentinel)
 csharp.py        types / methods / fields / properties / events / delegates,
                  lifecycle, string APIs, method_ref, field_call, `x?.Foo()`
 visual_assets.py Animator state machines + Timeline tracks/clips
 graph.py         SQLite union + call resolution + is_mono inheritance walk
                  + objects table + file_state (staleness) + atomic build
-queries.py       impact / refs / components (with hierarchy tree) / deadcode /
-                 find / validate / animator / timeline / digest / usage /
-                 error_report
+                 + prefab_mods + mb_fields
+queries.py       impact / refs (incl. `override:` nested edges) / components
+                 (with hierarchy tree) / deadcode / find / validate / animator /
+                 timeline / digest / usage / error_report
+                 / wiring (serialized wiring audit) / prefab_instances
 mcp_server.py    tools split into core/full/admin profiles
 ```
 
-Tests: 227 assertions / 34 groups on `tests/fixtures/SampleProject`.
+Tests: 266 assertions / 37 groups on `tests/fixtures/SampleProject`.
+
+## Round 12 — 按「需求更替后的真实瓶颈」重排优先级(0.12.0)
+
+Round 11 之后 README 的 roadmap 还剩一串未勾项(prefab override / AnimationEvent /
+Addressables / DOT / Roslyn)。本轮**没有按那个顺序推**,理由:
+
+- `unity_animator` / `unity_timeline` 在真实项目上**零调用**(calls.log 实测,
+  见 `usage` 输出) → 往 AnimationEvent / Timeline Signal 继续投入没人用;
+- Roslyn 的边际收益正被外部变化吃掉:团结引擎 2.0 推 AI Agent + 与清华合做 Coding
+  垂类模型,Unity 7 主打 CoreCLR —— 「C# 解析精度」在被官方和模型侧解决,
+  而正则路线在 0.11.1 已做到「丢 0 条真声明」;
+- 项目需求换到「UE 稿驱动 + 协议/配表未到位」之后,最高频的人工活变成
+  **核对 prefab 接线**:一次审计要 `execute_code` 反射遍历 41 个引用字段再人工判读
+  (约半小时),而且分不清「真断链」和「运行时缓存字段」。
+
+所以 0.12.0 做两件事:**序列化接线审计**(`unity_wiring`)+ **嵌套 prefab 覆盖**
+(`prefab_mods` / `unity_prefab_instances`)。后者同时是前者的前置 —— 不识别
+stripped 占位,前者在一个页面上产出 **101 条假 missing**。
+
+**诚实记账**:三条降噪规则都是**先跑出噪音再补**的,不是设计时想到的:
+
+| 规则 | 不做的后果(真实 prefab 实测) |
+| --- | --- |
+| stripped 占位跳过 | 101 条假 missing |
+| 委托 / Dictionary 不计 declared | 修完上一条仍剩 10 条假 missing |
+| `[NonSerialized]` 排除 | public 但不序列化的字段被当成漏接线 |
+
+修完之后的读数:`ok 84 / none 13 / broken 0 / dangling 0 / missing 0`。
+`none: 13` 与当天人工审计的「13 个 null」逐条对上,但其中一部分是设计如此
+(如 `RedDotUI._nodeName` 留空 = 红点常亮)—— 工具只负责摊开,不替人判。
 
 ## Open questions for the next model
 

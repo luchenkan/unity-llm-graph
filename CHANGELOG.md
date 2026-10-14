@@ -3,6 +3,43 @@
 > 每版的主题与实测数据。行为约定变更见 [REVIEWS.md](REVIEWS.md)，
 > 能力边界见 [README 的能力与局限](README.md#能力与局限诚实声明)。
 
+### 0.12.0
+
+主题:**从「谁引用了谁」到「到底接没接上线」** —— 补两类此前结构性看不见的耦合:
+prefab 里 MonoBehaviour 的序列化字段有没有接线,以及嵌套 prefab / variant 的字段覆盖。
+两类都在 4.4 万资产商业项目的真实 prefab 上量过,不是照 roadmap 猜的。
+
+| 盲点 | 规模(真实项目 `CardAlbumPageNew.prefab`) | 症状 |
+| --- | --- | --- |
+| 序列化字段未接线 | **97 个字段 / 13 个显式 null / 0 误报** | 人工要 execute_code 反射遍历再逐个判读,半小时起,且分不清「真断链」和「运行时缓存字段」 |
+| 嵌套实例引用 | 该 prefab 嵌套 **3 个源 prefab**、含 **16 个 stripped 占位** | `unity_refs` 对嵌套实例引用返回空(09-02 实测) |
+
+- **`unity_wiring`(新工具,进 `core` profile)**:把 C# 侧可序列化字段
+  (`[SerializeField]` / public,排除 `NonSerialized` 与委托 / Dictionary)与 YAML 里
+  实际出现过的字段对差,分 ok / scalar / none / broken / dangling / missing 六类,
+  missing 带启发式标注(下划线前缀 / 含 cache·tmp 等词 → 疑似运行时缓存),
+  **不替调用方下结论**。
+  ⚠ 三个降噪开关都是被真实数据逼出来的,少一个这台机器就废:
+  ① **stripped 占位文档跳过**并单独计到 `summary.nested_placeholders` ——
+  不跳的话实测一个页面 **101 条假 missing**;
+  ② **委托 / Dictionary 字段不计入 declared**(Unity 根本不序列化它们)——
+  修完 ① 之后剩下的 10 条 missing 全是 `LoopListView2` 的 `System.Action` 字段;
+  ③ `[NonSerialized]` 的 public 字段排除。
+- **`prefab_mods` 表 + `unity_prefab_instances`(新工具)**:解析 PrefabInstance(classID
+  1001)的 `m_SourcePrefab` + `m_Modifications[].objectReference`。嵌套实例的引用
+  **只写在父文件的 objectReference 上**,源 prefab 自己的 YAML 里没有 —— 这就是
+  09-02 返回空的根源。双向查询:给父 prefab 看它嵌套了谁/覆盖哪些字段(区分引用覆盖
+  与 Transform 标量覆盖),给源 prefab 看它被谁继承。
+- **`find_refs` 增益**:嵌套覆盖引用以 `override:<字段>` 出现在 `serialized_refs`,
+  与直接引用可区分。
+- **`mb_fields` 表**:MonoBehaviour 顶层序列化字段的出现记录,
+  shape = ref_external / ref_internal / scalar / empty。
+- **老库**:两张新表由 `update` 开头的 `executescript(SCHEMA)` 自动补;但存量 prefab
+  要重跑 `build`(或对目标 prefab 单独 `update`)才有数据 —— 查询侧给明确 hint,
+  不返回空让人误判成「没有字段」。
+- 测试 240 → **266 项断言 / 37 组**;新增 fixture `NestedChild` / `NestedParent`
+  (含 stripped 占位)/ `BrokenWiring`(覆盖 none/broken 两种断链形态)。
+
 ### 0.11.1
 
 主题:**声明解析的正确性回归** —— 0.10/0.11 引进的属性与事件正则有两类系统性错误:

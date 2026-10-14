@@ -226,13 +226,49 @@ TOOLS = [
             "required": ["target"],
         },
     },
+    {
+        "name": "unity_wiring",
+        "description": (
+            "prefab/scene 的**序列化接线审计**:把 C# 侧声明的可序列化字段"
+            "([SerializeField] / public,排除 NonSerialized)与 YAML 里实际出现过的字段"
+            "对差,分成 ok / scalar / none(YAML 里显式 null,对 UI 引用字段通常就是"
+            "「没接线」)/ broken(指向本文件不存在的 fileID)/ dangling(指向已删或未收录的"
+            "资产)/ missing(C# 声明了但 YAML 里没有 —— 多为运行时缓存字段,或继承自"
+            "基类 / 嵌套 prefab,带启发式标注)。"
+            "美术交 prefab 后、或排查「按钮点了没反应 / 界面一片空白」时先用它:"
+            "人工做法是 execute_code 反射遍历再逐个判读,一个页面半小时起。"),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": _TARGET_DESC},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["target"],
+        },
+    },
+    {
+        "name": "unity_prefab_instances",
+        "description": (
+            "嵌套 prefab / variant 的**覆盖关系**。给父 prefab:它嵌套了哪些源 prefab、"
+            "各覆盖多少字段、哪些是引用覆盖;给源 prefab:它被哪些 prefab 嵌套继承、"
+            "对方改写了它的哪些字段。嵌套实例的引用只写在父文件的 objectReference 里,"
+            "unity_refs 现在也能看到(字段带 override: 前缀),本工具给字段级全貌。"),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": _TARGET_DESC},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["target"],
+        },
+    },
 ]
 
 PROFILES = {
     # 日常会话只暴露查询工具,避免把维护工具 schema 和错误选项塞进模型上下文。
     "core": ("unity_impact", "unity_refs", "unity_components",
              "unity_find", "unity_context", "unity_animator", "unity_timeline",
-             "unity_error_report"),
+             "unity_error_report", "unity_wiring"),
     "full": tuple(t["name"] for t in TOOLS),
     "admin": ("unity_stats", "unity_dead_code", "unity_validate",
               "unity_rebuild", "unity_update"),
@@ -247,6 +283,8 @@ _DEFAULT_LIMITS = {
     "unity_animator": 20,
     "unity_timeline": 20,
     "unity_error_report": 5,
+    "unity_wiring": 20,
+    "unity_prefab_instances": 20,
 }
 
 
@@ -385,6 +423,11 @@ def make_dispatcher(project_root: str,
                 limit=int(args.get("limit", _DEFAULT_LIMITS.get(
                     "unity_error_report", 5))),
                 impact_limit=int(args.get("impact_limit", 6)))
+        elif name == "unity_wiring":
+            out = queries.wiring(project_root, args["target"], limit=limit)
+        elif name == "unity_prefab_instances":
+            out = queries.prefab_instances(project_root, args["target"],
+                                           limit=limit)
         elif name == "unity_update":
             paths = args.get("paths")
             if paths:

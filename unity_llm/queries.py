@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set
 
 from .graph import (connect, has_graph, build_command as graph_build_command,
                     check_stale, update_files)
-from .unity_yaml import CLASS_NAMES
+from .unity_yaml import CLASS_NAMES, STRIPPED_KEY
 
 DEFAULT_LIMIT = 60
 GOOD_CONF = ("high", "medium")
@@ -555,6 +555,17 @@ def find_refs(project_root: str, target: str, include_low: bool = False,
                 continue
             srefs.append({"src_path": r["src_path"], "field": r["field"],
                           "context": r["context"]})
+    # 嵌套 prefab / variant 的字段覆盖引用。引用只写在父文件的
+    # objectReference 上(不是源 prefab 自己的 YAML),旧版 refs 提取完全看不到
+    # —— 09-02 实测「嵌套实例引用」返回空。字段名带 override: 前缀以示区别。
+    if _has_table(conn, "prefab_mods"):
+        for g in guids:
+            for r in conn.execute(
+                    "SELECT src_path, property_path FROM prefab_mods"
+                    " WHERE obj_guid=? ORDER BY src_path", (g,)):
+                srefs.append({"src_path": r["src_path"],
+                              "field": "override:" + r["property_path"],
+                              "context": "nested-prefab override"})
     crefs = []
     # 目标是方法/字段/属性时必须按名字过滤:否则会把整个类型的边都端上来。
     name_clause = (" AND name=?" if node["kind"] in ("method", "field", "property", "event")
@@ -746,6 +757,268 @@ def components(project_root: str, target: str,
             if health.get("risky"):
                 out["summary"]["hint"] = (
                     "挂载点 0 可能不可信:" + health["message"])
+    conn.close()
+    return out
+
+
+# ---------------------------------------------------------------- wiring
+
+# 名字里带这些词的字段,大概率是运行时才赋值的缓存,不是漏接线。
+_CACHE_HINTS = ("cache", "tmp", "temp", "instance", "runtime", "self",
+                "transition", "tween", "pool")
+
+# Unity 根本不会序列化这些类型的字段。把它们算进「已声明」就会产出永远消不掉
+# 的假 missing —— 实测 CardAlbumPageNew.prefab 修掉 stripped 后剩下的 10 条
+# missing,全是 LoopListView2 的 System.Action / Action<,> 委托字段。
+_UNSER_TYPE_RE = re.compile(
+    r"^(System\.)?(Action|Func|EventHandler|Predicate|Comparison|Converter|"
+    r"Dictionary|IEnumerator|IntPtr|Delegate|Object\[\])\b")
+
+
+def _unity_serializable(ftype: str) -> bool:
+    """这个字段类型 Unity 会序列化吗?委托 / Dictionary 不会。"""
+    base = (ftype or "").split("<", 1)[0].strip()
+    if not base:
+        return True
+    return not _UNSER_TYPE_RE.match(base)
+
+
+def _missing_note(name: str) -> str:
+    if name.startswith("_"):
+        return "下划线前缀:项目惯例里多为运行时缓存字段(如 _activeScrollRect)"
+    low = name.lower()
+    for w in _CACHE_HINTS:
+        if w in low:
+            return "名字含 %r:疑似运行时缓存字段" % w
+    return "YAML 里没出现;可能来自基类或嵌套 prefab 继承,需人工确认"
+
+
+def wiring(project_root: str, target: str, limit: int = DEFAULT_LIMIT) -> Dict:
+    """prefab/scene 的**序列化接线审计**。
+
+    对每个 MonoBehaviour 实例,把「C# 侧声明的可序列化字段」与「YAML 里
+    实际出现过的字段」对差,分成六类:
+
+      ok        YAML 有该字段,且指向的目标真实存在
+      scalar    YAML 有该字段,值是标量(已赋值)
+      none      YAML 有该字段但值为 `{fileID: 0}` —— Unity 的 null,
+                对 UI 引用字段而言通常就是「没接线」
+      broken    YAML 有该字段,但指向本文件里不存在的 fileID
+      dangling  YAML 有该字段,但指向的资产 guid 已不在图谱里(被删/未收录)
+      missing   C# 声明了、YAML 里根本没有 —— 可能是运行时才赋值的缓存字段,
+                也可能继承自基类。带启发式标注,不替调用方下结论。
+
+    嵌套 prefab 实例在父文件里只有 stripped 占位文档(字段值在源 prefab 里),
+    这类会被跳过并单独计到 summary.nested_placeholders,不会污染 missing。
+
+    这件事 Editor MCP 做不了(它不知道哪些字段该被序列化),grep 更做不了;
+    人工做法是 execute_code 反射遍历 + 逐个判读,一个页面半小时起。
+    """
+    conn = connect(project_root)
+    node = resolve_target(conn, target)
+    out: Dict = {"target": target, "resolved": _present_node(node)}
+    if node["kind"] != "asset" or node.get("ext") not in (".prefab", ".unity"):
+        conn.close()
+        out["hint"] = ("接线审计只支持 prefab / scene 资产;"
+                       "当前解析为 %s" % node.get("kind"))
+        return out
+    if node.get("hint"):
+        out["hint"] = node["hint"]
+    conn, node = _apply_stale(out, conn, project_root, target, node)
+    if node["kind"] != "asset" or node.get("ext") not in (".prefab", ".unity"):
+        conn.close()
+        out["hint"] = out.get("hint") or "目标不是 prefab / scene 资产"
+        return out
+    src = node["guid"]
+    if not _has_table(conn, "mb_fields") or not conn.execute(
+            "SELECT 1 FROM mb_fields LIMIT 1").fetchone():
+        conn.close()
+        out["hint"] = ("mb_fields 为空:这个图谱建于 0.12.0 之前,没有接线数据。"
+                       "跑一次全量 build 后重试(增量 update 也会补收录的文件)。")
+        return out
+
+    fids = {r["fileid"] for r in conn.execute(
+        "SELECT fileid FROM objects WHERE src_guid=?", (src,)).fetchall()}
+    guid_ok = {r["guid"] for r in conn.execute("SELECT guid FROM assets")}
+
+    rows = conn.execute(
+        "SELECT fileid, script_guid, name AS go_name FROM objects"
+        " WHERE src_guid=? AND class_id=114 ORDER BY fileid", (src,)).fetchall()
+    comps: List[Dict] = []
+    problems: Dict[str, List[Dict]] = {
+        "broken": [], "dangling": [], "none": [], "missing": []}
+    counts = {"ok": 0, "scalar": 0, "none": 0, "broken": 0,
+              "dangling": 0, "missing": 0, "fields": 0, "nested": 0}
+
+    for r in rows:
+        ap = conn.execute("SELECT path FROM assets WHERE guid=?",
+                          (r["script_guid"],)).fetchone()
+        if not ap:
+            comps.append({"fileid": r["fileid"], "on": r["go_name"],
+                          "script": "<guid 未解析: %s>" % r["script_guid"][:8],
+                          "hint": "guidmap.tsv 可能过期,先 Dump GUID Map"})
+            continue
+        trows = conn.execute(
+            "SELECT full_name FROM types WHERE file=? AND is_mono=1",
+            (ap["path"],)).fetchall()
+        fields: List[Dict] = []
+        for tr in trows:
+            for m in conn.execute(
+                    "SELECT name, extra AS ftype, attributes FROM members"
+                    " WHERE owner=? AND kind='field' AND serialized=1",
+                    (tr["full_name"],)):
+                if "NonSerialized" in (m["attributes"] or ""):
+                    continue          # public 但显式不序列化
+                if not _unity_serializable(m["ftype"] or ""):
+                    continue          # 委托 / Dictionary:Unity 不序列化,报 missing 是噪音
+                fields.append({"name": m["name"], "type": m["ftype"] or ""})
+        kws = {k["field"]: k for k in conn.execute(
+            "SELECT field, shape, target_fileid, target_guid FROM mb_fields"
+            " WHERE src_guid=? AND fileid=?", (src, r["fileid"]))}
+        _sk = kws.get(STRIPPED_KEY)
+        if _sk is not None and _sk["shape"] == "stripped":
+            # 嵌套 prefab 的占位文档:字段值在源 prefab 里,在这里审只会得到
+            # 一片假 missing。跳过并指路 prefab_instances。
+            comps.append({"script": ap["path"], "on": r["go_name"],
+                          "fileid": r["fileid"], "nested": True,
+                          "note": ("嵌套 prefab 的 stripped 占位,字段值在源 prefab 里;"
+                                   "查覆盖关系用 unity_prefab_instances")})
+            counts["nested"] += 1
+            continue
+        entry = {"script": ap["path"], "on": r["go_name"], "fileid": r["fileid"],
+                 "fields": {"declared": len(fields), "in_yaml": len(kws)}}
+        comps.append(entry)
+        for f in fields:
+            counts["fields"] += 1
+            k = kws.get(f["name"])
+            base = {"script": os.path.basename(ap["path"]), "field": f["name"],
+                    "type": f["type"], "on": r["go_name"]}
+            if k is None:
+                counts["missing"] += 1
+                problems["missing"].append(dict(base, note=_missing_note(f["name"])))
+                continue
+            if k["shape"] == "scalar":
+                counts["scalar"] += 1
+            elif k["shape"] == "ref_external":
+                if not k["target_guid"]:
+                    counts["none"] += 1
+                    problems["none"].append(dict(base, note="引用无 guid"))
+                elif k["target_guid"] in guid_ok:
+                    counts["ok"] += 1
+                else:
+                    counts["dangling"] += 1
+                    problems["dangling"].append(
+                        dict(base, dst=k["target_guid"],
+                             note="指向的资产不在图谱里(被删或未收录)"))
+            elif k["shape"] == "ref_internal":
+                if k["target_fileid"] == 0:
+                    counts["none"] += 1
+                    problems["none"].append(dict(base, note="YAML 里显式为 null"))
+                elif k["target_fileid"] in fids:
+                    counts["ok"] += 1
+                else:
+                    counts["broken"] += 1
+                    problems["broken"].append(
+                        dict(base, target_fileid=k["target_fileid"],
+                             note="指向本文件不存在的 fileID"))
+            else:  # empty
+                counts["none"] += 1
+                problems["none"].append(dict(base, note="YAML 里是空值"))
+
+    out["components"] = comps
+    for key in ("broken", "dangling", "none"):
+        cap = _cap(problems[key], limit)
+        out[key] = cap["items"]
+        if cap["truncated"]:
+            out.setdefault("summary", {})["truncated_" + key] = cap["truncated"]
+    mcap = _cap(problems["missing"], limit)
+    out["missing"] = mcap["items"]
+    if mcap["truncated"]:
+        out.setdefault("summary", {})["truncated_missing"] = mcap["truncated"]
+    out["summary"] = dict({
+        "components": len(comps),
+        "nested_placeholders": counts["nested"],
+        "fields_checked": counts["fields"],
+        "ok": counts["ok"] + counts["scalar"],
+        "none": counts["none"],
+        "broken": counts["broken"],
+        "dangling": counts["dangling"],
+        "missing": counts["missing"],
+        "note": ("broken/dangling/none 基本等于「要修」;"
+                 "missing 需要人工判断(运行时缓存 or 继承),别一律当 bug;"
+                 "nested_placeholders 是嵌套 prefab 的 stripped 占位,已跳过"),
+    }, **out.get("summary", {}))
+    conn.close()
+    return out
+
+
+# ------------------------------------------------- 嵌套 prefab / variant
+
+def prefab_instances(project_root: str, target: str,
+                     limit: int = DEFAULT_LIMIT) -> Dict:
+    """嵌套 prefab 与 variant 的覆盖关系。
+
+    两个方向:
+      给**父** prefab → 它嵌套了哪些源 prefab、各覆盖了多少字段(overrides)
+      给**源** prefab → 它被哪些 prefab 嵌套/继承,对方改写了它的哪些字段
+        (inherited_by)—— 这一向是 09-02 实测的盲区:嵌套实例的引用只写在
+        父文件的 objectReference 里,旧版 refs 提取看不到,返回空。
+
+    引用是否断,可以继续用 wiring / validate 查;这里只回答「谁覆盖了谁」。
+    """
+    conn = connect(project_root)
+    node = resolve_target(conn, target)
+    out: Dict = {"target": target, "resolved": _present_node(node)}
+    if node["kind"] != "asset":
+        conn.close()
+        out["hint"] = "只支持 prefab 资产;当前解析为 %s" % node.get("kind")
+        return out
+    if not _has_table(conn, "prefab_mods") or not conn.execute(
+            "SELECT 1 FROM prefab_mods LIMIT 1").fetchone():
+        conn.close()
+        out["hint"] = ("prefab_mods 为空:图谱建于 0.12.0 之前,没有嵌套覆盖数据。"
+                       "跑一次全量 build 后重试。")
+        return out
+    guid = node["guid"]
+    path = node.get("path") or _asset_path(conn, guid)
+
+    # 方向一:这个文件自己嵌套了谁
+    own = conn.execute(
+        "SELECT source_guid, count(*) AS n FROM prefab_mods"
+        " WHERE src_guid=? GROUP BY source_guid", (guid,)).fetchall()
+    overrides = []
+    for r in own:
+        sp = _asset_path(conn, r["source_guid"])
+        rows = conn.execute(
+            "SELECT property_path, value, obj_guid FROM prefab_mods"
+            " WHERE src_guid=? AND source_guid=? ORDER BY property_path",
+            (guid, r["source_guid"])).fetchall()
+        ref_rows = [x for x in rows if x["obj_guid"]]
+        overrides.append({
+            "source": sp, "overrides": r["n"],
+            "fields": [x["property_path"] for x in rows][:limit],
+            "reference_overrides": [
+                {"field": x["property_path"], "dst": _asset_path(conn, x["obj_guid"])}
+                for x in ref_rows][:limit],
+        })
+    out["overrides"] = overrides
+
+    # 方向二:谁嵌套/继承了我
+    kids = conn.execute(
+        "SELECT src_guid, src_path, count(*) AS n FROM prefab_mods"
+        " WHERE source_guid=? GROUP BY src_guid ORDER BY n DESC", (guid,)).fetchall()
+    inherited_by = [{"prefab": r["src_path"], "overrides": r["n"]}
+                    for r in kids]
+    cap = _cap(inherited_by, limit)
+    out["inherited_by"] = cap["items"]
+    if cap["truncated"]:
+        out["summary"] = {"truncated_inherited_by": cap["truncated"]}
+    out["summary"] = dict({
+        "overrides": len(overrides),
+        "inherited_by": len(inherited_by),
+        "note": ("reference_overrides 才是嵌套实例的引用边;"
+                 "其余字段是 Transform / 标量覆盖,不代表耦合"),
+    }, **out.get("summary", {}))
     conn.close()
     return out
 

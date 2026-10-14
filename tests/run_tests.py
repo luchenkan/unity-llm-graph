@@ -72,7 +72,7 @@ def test_build():
     stats = graph.build(FIXTURE)
     check("脚本数", stats["scripts"] == 10, str(stats))
     check("类型数", stats["types"] == 21, str(stats))
-    check("YAML 资产数", stats["yaml_assets"] == 6, str(stats))
+    check("YAML 资产数", stats["yaml_assets"] == 9, str(stats))
     check("序列化引用数>=5", stats["refs"] >= 5, str(stats))
     check("资产数>=9", stats["assets"] >= 9, str(stats))
     check("UnityEvent 绑定==1", stats["events"] == 1, str(stats))
@@ -1256,6 +1256,92 @@ def test_declaration_edge_cases():
           any("Player.Strike" in c for c in callers), str(callers))
 
 
+def test_wiring():
+    print("[36] 序列化接线审计(wiring)")
+    r = queries.wiring(FIXTURE, "Assets/Prefabs/Enemy.prefab")
+    s = r["summary"]
+    enemy_comp = [c for c in r["components"] if "Enemy.cs" in c["script"]]
+    check("Enemy.cs 组件进了审计", len(enemy_comp) == 1, str(r["components"]))
+    check("Enemy.cs 侧 3 个可序列化字段(healthBar/hp/neverTouched)",
+          enemy_comp and enemy_comp[0]["fields"]["declared"] == 3,
+          str(enemy_comp))
+    check("Enemy.cs 的 YAML 侧出现 3 个 key(healthBar/hp + 与方法同名的"
+          "UnusedPrivateMethod,后者 C# 侧没有对应字段,不计入 declared)",
+          enemy_comp and enemy_comp[0]["fields"]["in_yaml"] == 3,
+          str(enemy_comp))
+    missing = {m["field"] for m in r["missing"]}
+    check("neverTouched 判为 missing(C# 有、YAML 无)",
+          "neverTouched" in missing, str(missing))
+    check("missing 带启发式标注而不是光秃秃一个名字",
+          all(m.get("note") for m in r["missing"]), str(r["missing"]))
+    check("Enemy.prefab 无 broken/dangling/none",
+          s["broken"] == 0 and s["dangling"] == 0 and s["none"] == 0, str(s))
+    check("全局 ok=2(healthBar 跨资产 guid 有效 + hp 标量)",
+          s["ok"] == 2, str(s))
+    # 断链的三种形态各来一条
+    r2 = queries.wiring(FIXTURE, "Assets/Prefabs/BrokenWiring.prefab")
+    s2 = r2["summary"]
+    check("BrokenWiring: hp 标量 → ok=1", s2["ok"] == 1, str(s2))
+    check("BrokenWiring: healthBar 为 {fileID: 0} → none=1",
+          s2["none"] == 1, str(s2))
+    check("BrokenWiring: neverTouched 指向不存在 fileID → broken=1",
+          s2["broken"] == 1, str(s2))
+    check("broken 条目带目标 fileID 便于定位",
+          any(b.get("target_fileid") == 98765432 for b in r2["broken"]),
+          str(r2["broken"]))
+    check("BrokenWiring 没有 missing(三个字段都在 YAML 里)",
+          s2["missing"] == 0, str(s2))
+    check("委托字段不参与 missing 判定(Unity 不序列化委托)",
+          queries._unity_serializable("System.Action") is False
+          and queries._unity_serializable("System.Action<A,B>") is False
+          and queries._unity_serializable("Dictionary<string,int>") is False
+          and queries._unity_serializable("List<string>") is True
+          and queries._unity_serializable("Image") is True, "")
+    # 非 prefab 目标要给人话,而不是抛异常
+    r3 = queries.wiring(FIXTURE, "Enemy")
+    check("类型目标给出可读 hint 而不是崩",
+          "hint" in r3 and "prefab" in r3["hint"], str(r3))
+    # 嵌套 prefab 的 stripped 占位不能污染 missing
+    r4 = queries.wiring(FIXTURE, "Assets/Prefabs/NestedParent.prefab")
+    check("stripped 占位被单独计数",
+          r4["summary"]["nested_placeholders"] == 1, str(r4["summary"]))
+    check("stripped 占位不产生 missing",
+          r4["summary"]["missing"] == 0, str(r4["summary"]))
+    check("stripped 组件在 components 里标 nested",
+          any(c.get("nested") and "Enemy.cs" in c["script"]
+              for c in r4["components"]), str(r4["components"]))
+
+
+def test_prefab_instances():
+    print("[37] 嵌套 prefab 覆盖(prefab_instances)")
+    r = queries.prefab_instances(FIXTURE, "Assets/Prefabs/NestedParent.prefab")
+    ov = r["overrides"]
+    check("父 prefab 列出一个源 prefab", len(ov) == 1, str(ov))
+    check("源是 NestedChild.prefab",
+          any("NestedChild.prefab" in o["source"] for o in ov), str(ov))
+    check("覆盖 3 个字段(m_Name/hp/healthBar)", ov[0]["overrides"] == 3, str(ov))
+    refs_ov = ov[0]["reference_overrides"]
+    check("引用覆盖只认 healthBar(Transform 覆盖不算耦合)",
+          [x["field"] for x in refs_ov] == ["healthBar"], str(refs_ov))
+    check("引用覆盖解析到 HealthBar.png",
+          any("HealthBar.png" in x["dst"] for x in refs_ov), str(refs_ov))
+    # 方向二:源 prefab 被谁继承 —— 09-02 实测返回空的那一向
+    r2 = queries.prefab_instances(FIXTURE, "Assets/Prefabs/NestedChild.prefab")
+    kids = r2["inherited_by"]
+    check("NestedChild 被 NestedParent 继承",
+          any("NestedParent.prefab" in k["prefab"] for k in kids), str(kids))
+    check("继承方覆盖数 3", bool(kids) and kids[0]["overrides"] == 3, str(kids))
+    # find_refs 现在也能看见嵌套覆盖引用(带 override: 前缀,避免与直接引用混淆)
+    rr = queries.find_refs(FIXTURE, "Assets/UI/HealthBar.png")
+    pairs = {(x["src_path"], x["field"]) for x in rr["serialized_refs"]}
+    check("find_refs 看到 NestedChild 的直接引用",
+          any("NestedChild.prefab" in p[0] and p[1] == "healthBar"
+              for p in pairs), str(pairs))
+    check("find_refs 看到 NestedParent 的覆盖引用(override: 前缀)",
+          any("NestedParent.prefab" in p[0] and p[1] == "override:healthBar"
+              for p in pairs), str(pairs))
+
+
 def main():
     try:  # Windows 控制台默认 GBK,测试输出里有中文
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1274,7 +1360,7 @@ def main():
              test_visual_query_end_to_end,
              test_stale_detection, test_digest, test_usage, test_error_report,
              test_properties, test_events_and_types,
-             test_declaration_edge_cases]
+             test_declaration_edge_cases, test_wiring, test_prefab_instances]
     failed = 0
     for t in tests:
         try:

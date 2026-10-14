@@ -339,12 +339,14 @@ token 预算,以及 **stale 检测(磁盘变更自愈/老库降级)、digest 聚
 **事件与委托入库、positional record、空条件调用 `x?.Foo()`**、
 **声明解析边界(switch 表达式类型模式臂不误当属性、`ref` 返回属性、
 `Generic<K,V>.Member` 类型、多声明符事件、嵌套类型 `full_name`)**。
-共 **240 项断言 / 35 个测试组**。
+共 **266 项断言 / 37 个测试组**。
 
 ## 能力与局限(诚实声明)
 
 **擅长:** 跨模块多跳追踪(谁调用了调用者)、改动爆炸半径、prefab/scene 引用定位、
 UnityEvent 绑定溯源、新人上手项目地图、**类型的完整 API 面(方法 / 字段 / 属性)**、
+**序列化接线审计(哪个 `[SerializeField]` 其实没接上线)**、
+**嵌套 prefab / variant 的字段覆盖(含引用覆盖)**、
 上下文瘦身(只给模型看签名和依赖,而不是整个文件)。
 
 **局限:**
@@ -369,6 +371,9 @@ UnityEvent 绑定溯源、新人上手项目地图、**类型的完整 API 面(�
 - 字符串耦合(`SendMessage`、`transform.Find` 路径)能检出,但无法验证目标存在性;
 - 全量重建中型项目(3.75 万资产 / 6 千脚本,实测)约 8-10 分钟,`graph.db` 约 250 MB;
   日常改动用 `update` 增量更新(秒级),调用边解析是全局的,update 后会整体重跑一次该步骤。
+- **`unity_wiring` 只审「直接声明在该脚本类型上」的序列化字段**:基类字段不进
+  declared(YAML 里由基类接的线因此不计 ok,`in_yaml` 会大于 `declared`,不报错);
+  `missing` 是「需要人看」的清单而不是 bug 清单,启发式标注只按命名习惯,不解析语义。
 
 ## 更新日志
 
@@ -389,7 +394,8 @@ UnityEvent 绑定溯源、新人上手项目地图、**类型的完整 API 面(�
 - [x] UnityEvent / Inspector 事件绑定的 YAML 提取
 - [x] Unity 本地 fileID 对象图(prefab/scene 的 GameObject 层级树 + 组件挂载,
   `unity_components` 输出 `hierarchy`,替代 Editor MCP 列层级)
-- [ ] prefab override `propertyPath` 语义(嵌套 prefab 的字段覆盖)
+- [x] prefab override `propertyPath` 语义(嵌套 prefab 的字段覆盖,`prefab_mods` 表
+      + `unity_prefab_instances` + `unity_wiring` 的 stripped 跳过)
 - [ ] AnimationEvent / Timeline Signal 静态入口
 - [ ] `transform.Find` 路径 ↔ 场景层级校验
 - [ ] Addressables / AssetBundle 分组分析

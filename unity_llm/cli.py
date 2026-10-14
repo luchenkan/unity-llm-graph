@@ -79,6 +79,17 @@ def cmd_timeline(args) -> int:
     return 0
 
 
+def cmd_wiring(args) -> int:
+    _print(args, queries.wiring(_project(args), args.target, limit=args.limit))
+    return 0
+
+
+def cmd_prefab_instances(args) -> int:
+    _print(args, queries.prefab_instances(_project(args), args.target,
+                                          limit=args.limit))
+    return 0
+
+
 def cmd_find(args) -> int:
     _print(args, queries.find_symbols(_project(args), args.pattern,
                                       limit=args.limit, kind=args.kind))
@@ -271,6 +282,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--target", required=True)
     add_limit(sp)
     sp.set_defaults(func=cmd_timeline)
+
+    sp = sub.add_parser("wiring",
+                        help="序列化接线审计:C# 可序列化字段 vs prefab YAML 实际接线")
+    add_project(sp)
+    sp.add_argument("--target", required=True)
+    add_limit(sp)
+    sp.set_defaults(func=cmd_wiring)
+
+    sp = sub.add_parser("prefab-instances",
+                        help="嵌套 prefab / variant 覆盖关系:谁覆盖了谁的哪些字段")
+    add_project(sp)
+    sp.add_argument("--target", required=True)
+    add_limit(sp)
+    sp.set_defaults(func=cmd_prefab_instances)
 
     sp = sub.add_parser("find", help="按名字模糊搜索类型/成员/资产")
     add_project(sp)
